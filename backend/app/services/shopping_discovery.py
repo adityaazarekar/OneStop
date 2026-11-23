@@ -164,26 +164,44 @@ def _candidate_quality_score(cand: dict[str, Any], brand: str | None = None) -> 
     return (-score, is_major_marketplace)
 
 
+def extract_root_domain(url: str) -> str:
+    """Extract registered root domain via `tldextract` (offline suffix list, zero network) or `extract_domain`."""
+    try:
+        import tldextract
+
+        ext = tldextract.extract(url or "")
+        if ext.domain and ext.suffix:
+            return f"{ext.domain}.{ext.suffix}".lower()
+    except Exception:
+        pass
+    return extract_domain(url)
+
+
 def build_transactional_searxng_queries(query: str) -> list[tuple[str, str]]:
     """
-    Angle 2 — Open-Web Transactional SearXNG Fan-Out (3 parallel intent-targeted queries):
-      1. Transactional Checkout Footprint
-      2. Universal E-Commerce URL Footprint (Shopify, WooCommerce, Magento, D2C)
-      3. Official Brand & Authorized Reseller Footprint
+    Stage 3 Open-Web Transactional SearXNG Fan-Out (4 parallel intent-targeted queries):
+      1. Transactional Checkout Web Query
+      2. Universal Storefront URL Pattern Query (Shopify, WooCommerce, Magento, BigCommerce, D2C)
+      3. Brand Direct & Authorized Dealer Query
+      4. Global / Cross-Border Query
     """
     q = query.strip().replace('"', "")
     return [
         (
             "searxng_checkout",
-            f'"{q}" ("Add to Cart" OR "Buy Now" OR "Add to Bag") ("₹" OR "Rs.") -review -youtube -reddit -pricehistory -91mobiles -smartprix',
+            f'"{q}" ("Add to Cart" OR "Buy Now" OR "Add to Bag") ("₹" OR "Rs.") -review -youtube -reddit -pricehistory -91mobiles -smartprix India',
         ),
         (
             "searxng_url_footprint",
-            f'"{q}" (inurl:/products/ OR inurl:/product/ OR inurl:/p/ OR inurl:/dp/) India price',
+            f'"{q}" (inurl:/products/ OR inurl:/product/ OR inurl:/p/ OR inurl:/dp/ OR inurl:/buy) India price',
         ),
         (
             "searxng_official_reseller",
             f'"{q}" ("official store" OR "authorized reseller" OR "buy online") India',
+        ),
+        (
+            "searxng_global_buy",
+            f'"{q}" buy online price India',
         ),
     ]
 
@@ -295,23 +313,25 @@ def select_diverse_candidates(
     current_domain: str,
     *,
     brand: str | None = None,
-    max_stores: int = 12,
+    max_stores: int = 15,
 ) -> list[dict[str, Any]]:
     """
-    Angle 3 & 4 — Filter blocked non-retailer domains, deduplicate by root domain
+    Angle 3 & 4 — Filter blocked non-retailer domains, deduplicate by root domain via `tldextract`
     (keeping highest-scoring URL per merchant), exclude current tab's domain,
-    and return up to `max_stores` (default 12) diverse unique merchants.
+    and return up to `max_stores` (default 15) diverse unique merchants without famous-site whitelist bias.
     """
+    cur_root = extract_root_domain(f"https://{current_domain}") if current_domain else ""
     best_by_domain: dict[str, dict[str, Any]] = {}
     for hit in hits:
         u = hit.get("url", "")
         if not _is_candidate_shopping_url(u, current_domain):
             continue
-        dom = extract_domain(u)
+        dom = extract_root_domain(u) or extract_domain(u)
+        if not dom or dom == cur_root:
+            continue
         if dom not in best_by_domain:
             best_by_domain[dom] = hit
         else:
-            # Prefer transactional product URL over generic landing URL on same domain
             if _candidate_quality_score(hit, brand) < _candidate_quality_score(best_by_domain[dom], brand):
                 best_by_domain[dom] = hit
 
@@ -322,21 +342,23 @@ def select_diverse_candidates(
 async def discover_stores(
     payload: ClientPayload,
     *,
-    max_stores: int = 12,
+    max_stores: int = 15,
+    on_quote_callback=None,
     redis_client: aioredis.Redis | None = None,
 ) -> DiscoverStoresResponse:
     """
     4-Angle Universal Multi-Store Discovery Pipeline (6h Redis cache, bounded concurrency):
       1. Optional Google Shopping Graph (Serper)
-      2. Parallel 3-query Open-Web Transactional SearXNG Fan-Out
+      2. Parallel 4-query Open-Web Transactional SearXNG Fan-Out
       3. Strict Non-Store Domain Blocklist
-      4. Deduplicate Current Page & Probe Top 10-12 Diverse Unique Domains
+      4. Deduplicate Current Page & Probe Up To 15 Diverse Unique Root Domains
+    Calls `on_quote_callback(quote)` the millisecond each verified store resolves for real-time SSE streaming.
     """
     query = build_normalized_query(payload)
     if len(query) < 3:
         return DiscoverStoresResponse(query=query, quotes=[], errors=["Product query too short"])
 
-    cache_key = f"discover:v2:{hashlib.sha256(f'{query.lower()}|{payload.retailer}'.encode()).hexdigest()}"
+    cache_key = f"discover:v3:{hashlib.sha256(f'{query.lower()}|{payload.retailer}'.encode()).hexdigest()}"
     r = redis_client or await _get_redis()
     if r is not None:
         try:
@@ -344,6 +366,12 @@ async def discover_stores(
             if cached_raw:
                 cached = DiscoverStoresResponse.model_validate_json(cached_raw)
                 cached.cached = True
+                if on_quote_callback:
+                    for q in cached.quotes:
+                        try:
+                            await on_quote_callback(q)
+                        except Exception:
+                            pass
                 return cached
         except Exception:
             pass
@@ -367,9 +395,6 @@ async def discover_stores(
     rejected_count = 0
     errors: list[str] = []
 
-    # Bounded concurrency: probe up to 12 diverse merchants; allow Tier-2 stealthy browser
-    # for top 6 candidates (regardless of whether they are famous or unknown D2C/regional)
-    # under rate_guard's global BROWSER_SEMAPHORE(2).
     async def _evaluate_candidate(idx: int, cand: dict[str, Any]) -> CompetitorQuote | None:
         nonlocal rejected_count
         url = cand["url"]
@@ -406,12 +431,18 @@ async def discover_stores(
             if not ok:
                 rejected_count += 1
                 return None
-            return payload_to_competitor_quote(
+            quote = payload_to_competitor_quote(
                 extracted,
                 match_score=score,
                 extraction_tier=tier_info,
                 source=cand.get("source", "searxng"),
             )
+            if on_quote_callback:
+                try:
+                    await on_quote_callback(quote)
+                except Exception:
+                    pass
+            return quote
 
         rejected_count += 1
         if tier_info.startswith(("circuit_open:", "blocked:")):

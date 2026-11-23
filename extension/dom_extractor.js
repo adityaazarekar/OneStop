@@ -382,6 +382,20 @@
           /(?:payment\s+)?handling\s+fee[^₹\d]{0,30}(?:₹|Rs\.?|INR)\s*([\d,]+)/i,
         ],
       },
+      {
+        label: "Surge / Rain Fee",
+        res: [
+          /\+?\s*(?:₹|Rs\.?|INR)\s*([\d,]+)\s*(?:for\s+)?(?:surge|rain|high\s+demand)\s+fee/i,
+          /(?:surge|rain|high\s+demand)\s+fee[^₹\d]{0,30}(?:₹|Rs\.?|INR)\s*([\d,]+)/i,
+        ],
+      },
+      {
+        label: "Small Cart Fee",
+        res: [
+          /\+?\s*(?:₹|Rs\.?|INR)\s*([\d,]+)\s*(?:for\s+)?small\s+(?:cart|order)\s+fee/i,
+          /small\s+(?:cart|order)\s+fee[^₹\d]{0,30}(?:₹|Rs\.?|INR)\s*([\d,]+)/i,
+        ],
+      },
     ];
     for (var i = 0; i < handlingSpecs.length; i++) {
       if (seen[handlingSpecs[i].label]) continue;
@@ -653,6 +667,11 @@
 
   function detectRetailer() {
     var h = window.location.hostname.toLowerCase();
+    var p = (window.location.pathname || "").toLowerCase();
+    if (h.indexOf("blinkit.com") !== -1) return "blinkit";
+    if (h.indexOf("zeptonow.com") !== -1 || h.indexOf("zepto.com") !== -1) return "zepto";
+    if (h.indexOf("swiggy.com") !== -1 && p.indexOf("instamart") !== -1) return "instamart";
+    if (h.indexOf("bigbasket.com") !== -1) return "bigbasket_now";
     if (h.indexOf("amazon.in") !== -1) return "amazon_in";
     if (h.indexOf("flipkart.com") !== -1) return "flipkart";
     if (h.indexOf("croma.com") !== -1) return "croma";
@@ -675,6 +694,61 @@
     if (h.indexOf("nike.com") !== -1) return "nike_official";
     if (h.indexOf("adidas.co.in") !== -1) return "adidas_official";
     return h.replace(/^www\./, "").replace(/[^a-z0-9]/g, "_").substring(0, 20) || "generic";
+  }
+
+  function computeUnitPrice(sellingPrice, text) {
+    if (!sellingPrice || sellingPrice <= 0 || !text) return null;
+    var s = String(text);
+    var m = s.match(/\b(\d+(?:\.\d+)?)\s*(kg|kilograms?|g|gm|gms|grams?|l|ltr|litres?|liters?|ml)\b/i);
+    if (m) {
+      var qty = parseFloat(m[1]);
+      var u = m[2].toLowerCase();
+      if (qty > 0) {
+        if (u.indexOf("k") === 0) {
+          var p100g = Math.round((sellingPrice / (qty * 1000)) * 100 * 10) / 10;
+          return { pack_size: m[1] + " " + m[2], unit_price_inr: p100g, unit_price_label: "₹" + p100g + "/100g" };
+        }
+        if (u.indexOf("g") === 0) {
+          var pg = Math.round((sellingPrice / qty) * 100 * 10) / 10;
+          return { pack_size: m[1] + " " + m[2], unit_price_inr: pg, unit_price_label: "₹" + pg + "/100g" };
+        }
+        if (u.indexOf("l") === 0) {
+          var p100ml = Math.round((sellingPrice / (qty * 1000)) * 100 * 10) / 10;
+          return { pack_size: m[1] + " " + m[2], unit_price_inr: p100ml, unit_price_label: "₹" + p100ml + "/100ml" };
+        }
+        if (u === "ml") {
+          var pml = Math.round((sellingPrice / qty) * 100 * 10) / 10;
+          return { pack_size: m[1] + " " + m[2], unit_price_inr: pml, unit_price_label: "₹" + pml + "/100ml" };
+        }
+      }
+    }
+    var cm = s.match(/\b(?:pack\s+of\s+(\d+)|(\d+)\s*(?:pcs|pieces|units|tabs|capsules|sachets))\b/i);
+    if (cm) {
+      var cnt = parseInt(cm[1] || cm[2], 10);
+      if (cnt > 0) {
+        var pu = Math.round((sellingPrice / cnt) * 10) / 10;
+        return { pack_size: cnt + " units", unit_price_inr: pu, unit_price_label: "₹" + pu + "/unit" };
+      }
+    }
+    return null;
+  }
+
+  function extractQuickCommerce(retailer) {
+    var data = extractUniversal(retailer);
+    var bodyHead = ((document.body && (document.body.innerText || document.body.textContent)) || "").replace(/\s+/g, " ").substring(0, 15000);
+    var etaM = bodyHead.match(/\b(\d{1,2}\s*(?:mins?|minutes?))\b/i);
+    var eta = etaM ? etaM[1].toLowerCase() : "10 mins";
+    var packEl = txt("[data-testid*='pack'], [class*='unit'], [class*='weight'], [class*='pack-size']");
+    var up = computeUnitPrice(data.listed_price, (packEl ? packEl + " " : "") + data.title);
+    data.variant_specs = data.variant_specs || {};
+    data.variant_specs.is_quick_commerce = true;
+    data.variant_specs.eta = eta;
+    if (up) {
+      data.variant_specs.pack_size = up.pack_size;
+      data.variant_specs.unit_price_inr = up.unit_price_inr;
+      data.variant_specs.unit_price_label = up.unit_price_label;
+    }
+    return data;
   }
 
   // ─── Amazon.in Extractor ─────────────────
@@ -1094,8 +1168,26 @@
       data = extractAmazon();
     } else if (retailer === "flipkart") {
       data = extractFlipkart();
+    } else if (
+      retailer === "blinkit" ||
+      retailer === "zepto" ||
+      retailer === "instamart" ||
+      retailer === "bigbasket_now"
+    ) {
+      data = extractQuickCommerce(retailer);
     } else {
       data = extractUniversal(retailer);
+    }
+
+    var ogImg = metaContent("og:image");
+    if (ogImg && !data.image_url) {
+      data.image_url = ogImg;
+    }
+    var up = computeUnitPrice(data.listed_price, data.title);
+    if (up && data.variant_specs && !data.variant_specs.unit_price_label) {
+      data.variant_specs.pack_size = up.pack_size;
+      data.variant_specs.unit_price_inr = up.unit_price_inr;
+      data.variant_specs.unit_price_label = up.unit_price_label;
     }
 
     data.retailer = retailer;

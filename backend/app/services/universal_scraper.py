@@ -779,8 +779,89 @@ def parse_shopify_product_json(
     )
 
 
-def _tier0_shopify_json_sync(json_url: str, timeout: float = 8.0) -> tuple[int, dict[str, Any] | None]:
-    """Tier 0: Fetch Shopify `<product_url>.json` via Scrapling Fetcher (0ms anti-bot friction)."""
+WOOCOMMERCE_PRODUCT_URL_RE = re.compile(r"/product/([a-zA-Z0-9._-]+?)/?$", re.I)
+
+
+def build_woocommerce_store_api_url(url: str) -> str | None:
+    """
+    Detect WooCommerce `/product/<slug>` URLs and construct the public WooCommerce Store API endpoint:
+    `https://store.in/wp-json/wc/store/v1/products?slug=<slug>`
+    """
+    if not url or not url.startswith(("http://", "https://")):
+        return None
+    parsed = urlparse(url)
+    m = WOOCOMMERCE_PRODUCT_URL_RE.search(parsed.path or "")
+    if not m:
+        return None
+    slug = m.group(1)
+    return f"{parsed.scheme}://{parsed.netloc}/wp-json/wc/store/v1/products?slug={slug}"
+
+
+def parse_woocommerce_store_api_json(
+    data: Any,
+    original_url: str,
+) -> ClientPayload | None:
+    """Parse WooCommerce Store API `/wp-json/wc/store/v1/products` response into ClientPayload."""
+    items = data if isinstance(data, list) else ([data] if isinstance(data, dict) else [])
+    if not items or not isinstance(items[0], dict):
+        return None
+    prod = items[0]
+    title = str(prod.get("name") or "").strip()
+    prices = prod.get("prices") or {}
+    if not title or not isinstance(prices, dict):
+        return None
+
+    minor_unit = int(prices.get("currency_minor_unit") or 2)
+    divisor = 10 ** minor_unit if minor_unit > 0 else 1
+    raw_price = prices.get("price") or prices.get("sale_price")
+    if raw_price is None:
+        return None
+    try:
+        price_val = round(float(raw_price) / divisor, 2)
+    except Exception:
+        return None
+    if price_val <= 0:
+        return None
+
+    mrp_val: float | None = None
+    raw_reg = prices.get("regular_price")
+    if raw_reg is not None:
+        try:
+            reg = round(float(raw_reg) / divisor, 2)
+            if reg >= price_val:
+                mrp_val = reg
+        except Exception:
+            pass
+
+    retailer = detect_retailer_key(original_url)
+    domain = extract_domain(original_url)
+    brand = extract_clean_brand(None, title, domain=domain)
+    in_stock = bool(prod.get("is_in_stock", True) and prod.get("is_purchasable", True))
+    sku = str(prod.get("sku") or prod.get("id") or _extract_sku_from_url(original_url))[:64]
+    images = prod.get("images") or []
+    img_url = images[0].get("src") if (images and isinstance(images[0], dict)) else None
+
+    return ClientPayload(
+        retailer=retailer,
+        url=original_url,
+        title=title[:300],
+        brand=brand or None,
+        sku=sku,
+        listed_price=price_val,
+        mrp=mrp_val,
+        image_url=img_url,
+        in_stock=in_stock,
+        seller_name="Official Direct Store",
+        variant_specs={
+            **extract_variant_specs_from_title(title),
+            "extraction_tier": "tier0_woocommerce_json",
+        },
+        source="server",
+    )
+
+
+def _tier0_json_sync(json_url: str, timeout: float = 8.0) -> tuple[int, Any]:
+    """Tier 0: Fetch Shopify `.json` or WooCommerce Store API JSON via Scrapling Fetcher."""
     try:
         from scrapling.fetchers import Fetcher
 
@@ -796,8 +877,9 @@ def _tier0_shopify_json_sync(json_url: str, timeout: float = 8.0) -> tuple[int, 
         raw = getattr(resp, "text", None) or getattr(resp, "html_content", None) or ""
         if not raw and hasattr(resp, "body") and isinstance(resp.body, (bytes, bytearray)):
             raw = resp.body.decode("utf-8", "ignore")
-        if raw.lstrip().startswith("{"):
-            return status, json.loads(raw)
+        stripped = raw.lstrip()
+        if stripped.startswith(("{", "[")):
+            return status, json.loads(stripped)
         return status, None
     except Exception:
         return 0, None
@@ -1024,12 +1106,12 @@ async def extract_from_url(
     last_html = ""
     last_final_url = url
 
-    # ── Tier 0: Shopify Universal JSON Fast-Path ──
+    # ── Tier 0: Universal Shopify & WooCommerce JSON Fast-Path ──
     shopify_json_url = build_shopify_json_url(url)
     if shopify_json_url:
         try:
-            async def _do_tier0() -> tuple[int, dict[str, Any] | None]:
-                return await asyncio.to_thread(_tier0_shopify_json_sync, shopify_json_url, 8.0)
+            async def _do_tier0() -> tuple[int, Any]:
+                return await asyncio.to_thread(_tier0_json_sync, shopify_json_url, 8.0)
 
             s0, jdata = await guarded_domain_call(
                 shopify_json_url,
@@ -1038,7 +1120,7 @@ async def extract_from_url(
                 max_attempts=1,
                 redis_client=redis_client,
             )
-            if s0 == 200 and jdata:
+            if s0 == 200 and isinstance(jdata, dict):
                 p0 = parse_shopify_product_json(jdata, url)
                 if p0 and p0.listed_price and p0.listed_price > 0:
                     bad, _ = is_generic_or_invalid_listing(p0.title, p0.listed_price, p0.url)
@@ -1048,6 +1130,30 @@ async def extract_from_url(
             return None, f"circuit_open:{exc.reason}"
         except Exception as exc:
             logger.debug("Tier 0 Shopify JSON skipped for %s: %s", url, exc)
+
+    woo_json_url = build_woocommerce_store_api_url(url)
+    if woo_json_url:
+        try:
+            async def _do_tier0_woo() -> tuple[int, Any]:
+                return await asyncio.to_thread(_tier0_json_sync, woo_json_url, 8.0)
+
+            sw, wdata = await guarded_domain_call(
+                woo_json_url,
+                _do_tier0_woo,
+                use_browser_semaphore=False,
+                max_attempts=1,
+                redis_client=redis_client,
+            )
+            if sw == 200 and wdata:
+                pw = parse_woocommerce_store_api_json(wdata, url)
+                if pw and pw.listed_price and pw.listed_price > 0:
+                    bad, _ = is_generic_or_invalid_listing(pw.title, pw.listed_price, pw.url)
+                    if not bad:
+                        return pw, "tier0_woocommerce_json"
+        except CircuitOpenError as exc:
+            return None, f"circuit_open:{exc.reason}"
+        except Exception as exc:
+            logger.debug("Tier 0 WooCommerce JSON skipped for %s: %s", url, exc)
 
     # ── Tier 1: Fast HTTP/3 + TLS impersonation ──
     try:

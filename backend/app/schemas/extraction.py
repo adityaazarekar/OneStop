@@ -48,6 +48,8 @@ class ClientPayload(BaseModel):
     listed_price: float | None = None
     mrp: float | None = None
     retailer_advertised_lowest_price: float | None = None
+    image_url: str | None = None
+    pincode: str | None = None
     in_stock: bool = True
     seller_name: str | None = None
     seller_rating: float | None = None
@@ -114,7 +116,31 @@ class CompetitorQuote(BaseModel):
     bank_offer_summary: str | None = None
     match_score: float | None = None
     extraction_tier: str | None = None
+    image_url: str | None = None
     source: str | None = None  # "extension_offscreen" | "searxng" | "serper"
+
+
+class QuickCommerceQuote(BaseModel):
+    """Location-aware 10-minute Quick Commerce quote (Blinkit, Zepto, Instamart, BigBasket Now, Flipkart Minutes, JioMart Quick)."""
+
+    platform: str
+    app_name: str
+    title: str
+    url: str
+    pincode: str = "411001"
+    selling_price: float
+    mrp: float | None = None
+    pack_size: str | None = None
+    unit_price_inr: float | None = None
+    unit_price_label: str | None = None  # e.g. "₹24/100g" or "₹15/unit"
+    eta_minutes_label: str = "10 mins"
+    in_stock: bool = True
+    handling_fee_inr: float = 0.0
+    delivery_fee_inr: float = 0.0
+    surge_fee_inr: float = 0.0
+    small_cart_fee_inr: float = 0.0
+    total_payable_inr: float = 0.0
+    badge: str = "10-Min Quick Commerce"
 
 
 class AnalyzePayloadRequest(BaseModel):
@@ -123,6 +149,7 @@ class AnalyzePayloadRequest(BaseModel):
     payload: ClientPayload
     competitor_quotes: list[CompetitorQuote] = Field(default_factory=list)
     user_card_ids: list[str] = Field(default_factory=list)
+    pincode: str | None = None
 
 
 # ───────────────────────────────────────────
@@ -375,7 +402,7 @@ class ExecutiveSummary(BaseModel):
 # ───────────────────────────────────────────
 # Live Payment T&C Rules + Cash-vs-Points Transparency
 # ───────────────────────────────────────────
-VerificationStatus = Literal["page_verified", "live_tc_verified", "no_verified_offer"]
+VerificationStatus = Literal["page_verified", "live_tc_verified", "issuer_tc_verified", "no_verified_offer"]
 
 
 class VerifiedPaymentRule(BaseModel):
@@ -460,15 +487,30 @@ class CashVsPointsReport(BaseModel):
 # ───────────────────────────────────────────
 class DiscoverStoresRequest(BaseModel):
     payload: ClientPayload
-    max_stores: int = Field(default=8, ge=1, le=15)
+    max_stores: int = Field(default=15, ge=1, le=20)
+    pincode: str | None = None
 
 
 class DiscoverStoresResponse(BaseModel):
     query: str
     quotes: list[CompetitorQuote] = Field(default_factory=list)
+    quick_commerce_quotes: list[QuickCommerceQuote] = Field(default_factory=list)
     rejected_count: int = 0
     cached: bool = False
     errors: list[str] = Field(default_factory=list)
+
+
+class CompareAllStoresRequest(BaseModel):
+    payload: ClientPayload
+    pincode: str = "411001"
+    user_card_ids: list[str] = Field(default_factory=list)
+
+
+class CompareAllStoresResponse(BaseModel):
+    job_id: str
+    pincode: str
+    cached_stores: list[CompetitorQuote] = Field(default_factory=list)
+    cached_quick_commerce: list[QuickCommerceQuote] = Field(default_factory=list)
 
 
 class AnalysisResponse(BaseModel):
@@ -492,6 +534,7 @@ class AnalysisResponse(BaseModel):
     stacked_offers: StackedEffectivePriceResult | None = None
     seller_report: MultiSellerReport | None = None
     ranked_store_choices: list[StoreRankingChoice] = Field(default_factory=list)
+    quick_commerce_quotes: list[QuickCommerceQuote] = Field(default_factory=list)
     llm_summary: ExecutiveSummary | None = None
     cash_vs_points: CashVsPointsReport | None = None
 

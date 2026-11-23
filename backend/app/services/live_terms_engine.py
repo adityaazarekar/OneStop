@@ -168,7 +168,12 @@ def build_issuer_tc_query(card_name: str, retailer: str = "") -> str:
 
 
 def _fast_http_tc_text_sync(url: str, timeout: float = 7.0) -> str:
-    """Fast Tier-1 HTTP fetch before heavy Playwright Crawl4AI (avoids Chromium launch timeouts)."""
+    """
+    Stage 2 Fast Static T&C Fetch:
+    Uses `scrapling.fetchers.Fetcher` + `trafilatura.extract(include_tables=True)`
+    (ultra-fast, zero browser RAM). Falls back to BeautifulSoup + `extract_markdown_with_fallback`
+    before escalating to Crawl4AI (`AsyncWebCrawler`) if output is < 300 chars.
+    """
     try:
         from bs4 import BeautifulSoup
         from scrapling.fetchers import Fetcher
@@ -180,6 +185,23 @@ def _fast_http_tc_text_sync(url: str, timeout: float = 7.0) -> str:
         html = getattr(resp, "html_content", None) or getattr(resp, "text", None) or ""
         if not html or len(html) < 400:
             return ""
+
+        # 1. Primary: Trafilatura table-aware extraction
+        try:
+            import trafilatura
+
+            traf_text = trafilatura.extract(
+                html,
+                include_tables=True,
+                include_comments=False,
+                favor_recall=True,
+            )
+            if traf_text and len(traf_text.strip()) >= 300:
+                return extract_markdown_with_fallback(traf_text, max_chars=7000)
+        except Exception:
+            pass
+
+        # 2. Fallback: BeautifulSoup line slicer
         soup = BeautifulSoup(html, "lxml")
         for tag in soup(["script", "style", "nav", "header", "footer", "aside", "svg", "noscript"]):
             tag.decompose()
@@ -500,16 +522,21 @@ async def get_or_verify_rule(
     search_query: str,
     allow_live_crawl: bool = True,
     redis_client: aioredis.Redis | None = None,
+    db_session=None,
 ) -> VerifiedPaymentRule:
     """
-    Fetch a verified payment rule from 7-day Redis cache (`tc_cache:{route_key}`),
-    or live-discover via SearXNG + Crawl4AI (PruningContentFilter threshold=0.45) + Instructor.
-    Strict honesty: returns ₹0 `no_verified_offer` when no live T&C can be verified.
+    2-Speed Live T&C Auditor:
+    1. Fast Path (<100ms): Reads 7-day Redis cache (`tc_cache:{route_key}`) OR active temporal
+       Knowledge Graph edges (`kg_edges` where `valid_to IS NULL OR valid_to > NOW()`).
+    2. Background Audit Path (`Trafilatura` -> `Crawl4AI` -> `Instructor`):
+       When `allow_live_crawl=False` and rule is missing, schedules `audit_issuer_terms_job`
+       in the background and immediately returns honest `no_verified_offer` (₹0) so Stage 1
+       never blocks on slow web crawls.
     """
     r = redis_client or await _get_redis()
     key = _route_cache_key(route_kind, method_name, retailer)
 
-    # 1. Fast path: 7-day Redis cache (<10ms)
+    # 1a. Fast path: 7-day Redis cache (<10ms)
     if r is not None:
         try:
             raw = await r.get(key)
@@ -518,6 +545,30 @@ async def get_or_verify_rule(
         except Exception:
             pass
 
+    # 1b. Fast path: PostgreSQL Temporal Knowledge Graph (<25ms) — only on real AsyncSession, never concurrently
+    from sqlalchemy.ext.asyncio import AsyncSession as _RealAsyncSession
+
+    if db_session is not None and type(db_session) is _RealAsyncSession:
+        try:
+            from app.services.kg_service import load_verified_rule_from_kg
+
+            kg_rule = await load_verified_rule_from_kg(
+                db_session,
+                method_name=method_name,
+                method_type=method_type,
+                retailer=retailer,
+                max_age_days=7,
+            )
+            if kg_rule is not None:
+                if r is not None:
+                    try:
+                        await r.set(key, kg_rule.model_dump_json(), ex=TC_CACHE_TTL_SECONDS)
+                    except Exception:
+                        pass
+                return kg_rule
+        except Exception as exc:
+            logger.debug("KG rule lookup skipped for %s: %s", method_name, exc)
+
     if not allow_live_crawl:
         return build_no_verified_offer_rule(
             method_name,
@@ -525,7 +576,7 @@ async def get_or_verify_rule(
             reason="No active verified offer found (click 'Verify Live T&Cs' to crawl official issuer terms).",
         )
 
-    # 2. Cache miss: SearXNG -> Fast HTTP / Crawl4AI (fit_markdown -> raw_markdown fallback) -> Instructor
+    # 2. Live Audit Path: SearXNG -> Trafilatura (<300 chars escalates to Crawl4AI fit/raw markdown) -> Instructor
     urls = await _discover_tc_urls(search_query, max_urls=2)
     if not urls:
         logger.warning("Live T&C skipped for '%s': SearXNG returned no candidate URLs for query '%s'", method_name, search_query)
@@ -550,7 +601,7 @@ async def get_or_verify_rule(
     if parsed is None:
         parsed = _deterministic_tc_parse(combined_md, method_name, method_type, used_urls)
 
-    if parsed is None or parsed.verification_status != "live_tc_verified":
+    if parsed is None or parsed.verification_status not in ("live_tc_verified", "issuer_tc_verified"):
         logger.warning("Live T&C parser found no verifiable concrete rates for '%s' from %s", method_name, used_urls)
         return build_no_verified_offer_rule(method_name, method_type)
 
@@ -559,6 +610,14 @@ async def get_or_verify_rule(
             await r.set(key, parsed.model_dump_json(), ex=TC_CACHE_TTL_SECONDS)
         except Exception:
             pass
+
+    if db_session is not None:
+        try:
+            from app.services.kg_service import persist_verified_rule_to_kg
+
+            await persist_verified_rule_to_kg(db_session, parsed, retailer)
+        except Exception as exc:
+            logger.debug("KG persistence skipped for %s: %s", method_name, exc)
 
     return parsed
 
@@ -570,9 +629,11 @@ async def resolve_live_payment_rules(
     allow_live_crawl: bool = True,
     timeout_seconds: float = 14.0,
     redis_client: aioredis.Redis | None = None,
+    db_session=None,
 ) -> list[VerifiedPaymentRule]:
     """
-    Resolve verified payment rules ONLY from 7-day Redis cache or live Crawl4AI + Instructor.
+    Resolve verified payment rules from 7-day Redis cache, PostgreSQL Temporal Knowledge Graph
+    (`kg_edges`), or live Trafilatura/Crawl4AI + Instructor audit.
     Zero hardcoded ESTIMATE fallbacks: unverified routes strictly return ₹0 (`no_verified_offer`).
     """
     r = redis_client or await _get_redis()
@@ -593,6 +654,7 @@ async def resolve_live_payment_rules(
                 search_query=build_issuer_tc_query(card.card_name, retailer),
                 allow_live_crawl=allow_live_crawl,
                 redis_client=r,
+                db_session=db_session,
             )
         )
 
@@ -607,6 +669,7 @@ async def resolve_live_payment_rules(
             search_query=f"HDFC SmartBuy GyFTR {store_name} voucher reward points processing fee monthly cap",
             allow_live_crawl=allow_live_crawl,
             redis_client=r,
+            db_session=db_session,
         )
     )
 
@@ -621,6 +684,7 @@ async def resolve_live_payment_rules(
             search_query=f"{store_name} UPI cashback offer terms Google Pay PhonePe CRED Super.money",
             allow_live_crawl=allow_live_crawl,
             redis_client=r,
+            db_session=db_session,
         )
     )
 

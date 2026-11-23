@@ -145,6 +145,27 @@ export interface StoreRankingChoice {
   is_overall_winner: boolean;
 }
 
+export interface QuickCommerceQuote {
+  platform: string;
+  app_name: string;
+  title: string;
+  url: string;
+  pincode: string;
+  selling_price: number;
+  mrp?: number | null;
+  pack_size?: string | null;
+  unit_price_inr?: number | null;
+  unit_price_label?: string | null;
+  eta_minutes_label: string;
+  in_stock: boolean;
+  handling_fee_inr: number;
+  delivery_fee_inr: number;
+  surge_fee_inr: number;
+  small_cart_fee_inr: number;
+  total_payable_inr: number;
+  badge: string;
+}
+
 export interface ExecutiveSummary {
   best_store: string;
   best_seller: string;
@@ -224,6 +245,7 @@ export interface AnalysisResponse {
   stacked_offers?: StackedEffectivePriceResult | null;
   seller_report?: MultiSellerReport | null;
   ranked_store_choices?: StoreRankingChoice[];
+  quick_commerce_quotes?: QuickCommerceQuote[];
   llm_summary?: ExecutiveSummary | null;
   cash_vs_points?: CashVsPointsReport | null;
 }
@@ -258,6 +280,7 @@ export interface ProductDetails {
   stacked_offers?: StackedEffectivePriceResult | null;
   seller_report?: MultiSellerReport | null;
   ranked_store_choices?: StoreRankingChoice[];
+  quick_commerce_quotes?: QuickCommerceQuote[];
   llm_summary?: ExecutiveSummary | null;
   cash_vs_points?: CashVsPointsReport | null;
 }

@@ -20,6 +20,9 @@ class Settings(BaseSettings):
     openrouter_model: str = "google/gemini-2.5-flash"
     searxng_url: str = "http://localhost:8080"
     serper_api_key: str = ""
+    default_pincode: str = "411001"
+    quickcommerce_api_key: str = ""
+    scrapingdog_api_key: str = ""
     app_secret_key: str = "change-me-in-production"
     cors_origins: list[str] = Field(default=["http://localhost:3000", "http://127.0.0.1:3000"])
 

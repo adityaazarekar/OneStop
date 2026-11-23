@@ -155,13 +155,27 @@
   let currentPayload = null;
   let currentAnalysis = null;
   let competitorQuotes = null;
+  let quickCommerceQuotes = [];
   let isComparing = false;
+  let streamProgressMsg = "";
+  let userPincode = "411001";
+  let activeCompareEventSource = null;
   let activeUrl = "";
   let activeRequestId = 0;
   let host = null;
   let shadow = null;
   let pill = null;
   let drawer = null;
+
+  try {
+    if (typeof chrome !== "undefined" && chrome.storage && chrome.storage.local) {
+      chrome.storage.local.get(["onestop_pincode"], (res) => {
+        if (res && res.onestop_pincode && /^\d{6}$/.test(String(res.onestop_pincode))) {
+          userPincode = String(res.onestop_pincode);
+        }
+      });
+    }
+  } catch (_) {}
 
   function ensureWidget() {
     if (host) return;
@@ -475,9 +489,12 @@
 
   // ── Render Drawer ────────────────────────
 
-  function verificationBadge(status) {
+  function verificationBadge(status, lastVerifiedAt) {
+    const dt = lastVerifiedAt ? new Date(lastVerifiedAt).toLocaleDateString("en-IN", { day: "numeric", month: "short" }) : "";
     if (status === "page_verified") return `<span class="os-badge os-badge-page">Page Verified</span>`;
-    if (status === "live_tc_verified") return `<span class="os-badge os-badge-tc">Live T&amp;C Verified</span>`;
+    if (status === "live_tc_verified" || status === "issuer_tc_verified") {
+      return `<span class="os-badge os-badge-tc">Official T&amp;C Verified${dt ? " • " + esc(dt) : ""}</span>`;
+    }
     return `<span class="os-badge os-badge-none">No Verified Offer</span>`;
   }
 
@@ -642,9 +659,23 @@
       </div>`;
     }
 
-    // ── Section 3: All-Stores Comparison (Stage 2) ──
+    // ── Section 3: All Online Stores & D2C Marketplaces + Quick Commerce (10-Min Delivery) ──
     bodyHtml += `<div class="os-section">
-      <div class="os-section-title">🏪 All-Stores Comparison</div>`;
+      <div class="os-row" style="margin-bottom:8px;">
+        <div class="os-section-title" style="margin-bottom:0;">🏪 All Online Stores &amp; D2C Marketplaces</div>
+        <div style="display:flex;align-items:center;gap:4px;font-size:11px;">
+          <span style="color:#64748b;">Pincode:</span>
+          <input id="osPincodeInput" type="text" maxlength="6" value="${esc(userPincode)}" style="width:62px;padding:2px 6px;border:1px solid #cbd5e1;border-radius:6px;font-size:11px;font-weight:700;color:#0f172a;" />
+        </div>
+      </div>`;
+
+    if (isComparing || streamProgressMsg) {
+      bodyHtml += `
+        <div style="background:#eef2ff;border:1px solid #c7d2fe;border-radius:8px;padding:6px 10px;margin-bottom:8px;font-size:11px;color:#3730a3;display:flex;align-items:center;gap:6px;">
+          ${isComparing ? '<span class="spinner" style="border-color:#818cf8;border-top-color:#312e81;"></span>' : '<span>✓</span>'}
+          <span>${esc(streamProgressMsg || ("Checking stores & 10-min apps for pincode " + userPincode + "..."))}</span>
+        </div>`;
+    }
 
     const ranked = a.ranked_store_choices || [];
     if (ranked.length > 0) {
@@ -675,12 +706,45 @@
           </table>
         </div>`;
     }
+
+    const qcList = (quickCommerceQuotes && quickCommerceQuotes.length > 0)
+      ? quickCommerceQuotes
+      : (a.quick_commerce_quotes || []);
     bodyHtml += `
+      <div style="margin-top:10px;padding-top:8px;border-top:1px dashed #e2e8f0;">
+        <div class="os-section-title" style="color:#059669;margin-bottom:6px;">⚡ Quick Commerce (10-Min Delivery · ${esc(userPincode)})</div>
+        ${qcList.length > 0 ? `
+          <div class="os-table-wrap">
+            <table class="os-table">
+              <thead>
+                <tr><th>App / ETA</th><th>Unit Price</th><th>Fees</th><th>Total Payable</th><th>Link</th></tr>
+              </thead>
+              <tbody>
+                ${qcList.map((qc) => {
+                  const qHref = safeHref(qc.url);
+                  const feesTotal = (qc.handling_fee_inr || 0) + (qc.delivery_fee_inr || 0) + (qc.surge_fee_inr || 0) + (qc.small_cart_fee_inr || 0);
+                  return `
+                    <tr>
+                      <td>
+                        <strong>${esc(qc.app_name)}</strong>
+                        <div style="font-size:10px;color:#059669;font-weight:700;">⚡ ${esc(qc.eta_minutes_label || "10 mins")}</div>
+                      </td>
+                      <td>${esc(qc.unit_price_label || qc.pack_size || "—")}</td>
+                      <td style="color:#b91c1c;">+${fmt(feesTotal)}</td>
+                      <td><strong>${fmt(qc.total_payable_inr || qc.selling_price)}</strong></td>
+                      <td>${qHref ? `<a href="${qHref}" target="_blank" rel="noopener noreferrer" class="os-link">Open →</a>` : "—"}</td>
+                    </tr>`;
+                }).join("")}
+              </tbody>
+            </table>
+          </div>
+        ` : `<div style="font-size:11px;color:#64748b;">Click Compare below to check Blinkit, Zepto, Swiggy Instamart, BigBasket Now &amp; JioMart Quick for pincode ${esc(userPincode)}.</div>`}
+      </div>
       <button class="os-btn-compare" id="osBtnCompare" style="margin-top:8px;" ${isComparing ? "disabled" : ""}>
-        ${isComparing ? '<span class="spinner"></span> Searching All Stores...' : "🔍 Compare All Stores"}
+        ${isComparing ? '<span class="spinner"></span> Streaming Stores &amp; 10-Min Apps...' : "🔍 Compare All Stores &amp; 10-Min Apps"}
       </button>
       <div style="font-size:10.5px;color:#64748b;margin-top:4px;text-align:center;">
-        SearXNG + Scrapling universal check · 6h cache · 30m circuit breaker
+        Live SSE Streaming · 15-Domain Universal + Quick Commerce · 30m Circuit Breaker
       </div>
     </div>`;
 
@@ -732,16 +796,130 @@
     `;
 
     shadow.getElementById("osClose")?.addEventListener("click", () => drawer.classList.remove("os-open"));
+    const pinInput = shadow.getElementById("osPincodeInput");
+    if (pinInput) {
+      pinInput.addEventListener("change", (ev) => {
+        const val = String(ev.target.value || "").replace(/\D/g, "");
+        if (val.length === 6) {
+          userPincode = val;
+          try {
+            if (typeof chrome !== "undefined" && chrome.storage && chrome.storage.local) {
+              chrome.storage.local.set({ onestop_pincode: val });
+            }
+          } catch (_) {}
+        }
+      });
+    }
     shadow.getElementById("osBtnCompare")?.addEventListener("click", () => {
       if (!currentPayload || isComparing) return;
+      const pinVal = shadow.getElementById("osPincodeInput")?.value?.replace(/\D/g, "") || userPincode;
+      if (pinVal.length === 6) userPincode = pinVal;
+      currentPayload.pincode = userPincode;
       isComparing = true;
+      streamProgressMsg = `Checking stores & 10-min apps for pincode ${userPincode}...`;
       renderResult(data);
-      chrome.runtime.sendMessage({
-        type: "ONESTOP_COMPARE_CROSS_STORE",
-        payload: currentPayload,
-        requestUrl: activeUrl,
-      });
+      startLiveSseComparison(data);
     });
+  }
+
+  function startLiveSseComparison(data) {
+    if (activeCompareEventSource) {
+      try { activeCompareEventSource.close(); } catch (_) {}
+      activeCompareEventSource = null;
+    }
+    fetch("http://localhost:8000/api/v1/compare-all-stores", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ payload: currentPayload, pincode: userPincode }),
+    })
+      .then((r) => r.json())
+      .then((jobInfo) => {
+        if (!jobInfo || !jobInfo.job_id) throw new Error("No job_id");
+        const es = new EventSource(`http://localhost:8000/api/v1/stream-compare/${encodeURIComponent(jobInfo.job_id)}`);
+        activeCompareEventSource = es;
+
+        es.addEventListener("progress", (e) => {
+          try {
+            const d = JSON.parse(e.data);
+            if (d.message) {
+              streamProgressMsg = d.message;
+              renderResult(data);
+            }
+          } catch (_) {}
+        });
+
+        es.addEventListener("store_quote", (e) => {
+          try {
+            const d = JSON.parse(e.data);
+            const q = d.quote;
+            if (q && currentAnalysis) {
+              const list = currentAnalysis.ranked_store_choices || [];
+              if (!list.some((s) => s.url === q.url || s.retailer === q.retailer)) {
+                const cashP = Math.round((q.listed_price || 0) + (q.delivery_fee || 0));
+                list.push({
+                  retailer: q.retailer,
+                  store_name: retailerLabel(q.retailer),
+                  url: q.url,
+                  listed_price: q.listed_price,
+                  checkout_cash_price: cashP,
+                  best_user_card_net_price: cashP,
+                  effective_price: cashP,
+                  is_current_store: false,
+                  seller_name: q.seller_name || "Verified Store",
+                  peace_of_mind_score: 78,
+                  rank_badge: "Live Verified",
+                  is_overall_winner: false,
+                });
+                currentAnalysis.ranked_store_choices = list;
+                streamProgressMsg = `Verified ${retailerLabel(q.retailer)} (${fmt(cashP)})...`;
+                renderResult({ success: true, analysis: currentAnalysis, payload: currentPayload });
+              }
+            }
+          } catch (_) {}
+        });
+
+        es.addEventListener("quick_commerce_quote", (e) => {
+          try {
+            const d = JSON.parse(e.data);
+            const qc = d.quote;
+            if (qc) {
+              if (!quickCommerceQuotes.some((x) => x.platform === qc.platform)) {
+                quickCommerceQuotes.push(qc);
+                streamProgressMsg = `Found ${qc.app_name} (${qc.eta_minutes_label}: ${fmt(qc.total_payable_inr)})...`;
+                renderResult({ success: true, analysis: currentAnalysis, payload: currentPayload });
+              }
+            }
+          } catch (_) {}
+        });
+
+        es.addEventListener("complete", (e) => {
+          isComparing = false;
+          try {
+            const d = JSON.parse(e.data);
+            streamProgressMsg = `Completed: ${d.stores_count || 0} online stores + ${d.quick_commerce_count || 0} quick-commerce apps checked.`;
+          } catch (_) {
+            streamProgressMsg = "Multi-store & Quick-Commerce check complete.";
+          }
+          es.close();
+          activeCompareEventSource = null;
+          renderResult({ success: true, analysis: currentAnalysis, payload: currentPayload });
+        });
+
+        es.onerror = () => {
+          isComparing = false;
+          es.close();
+          activeCompareEventSource = null;
+          renderResult({ success: true, analysis: currentAnalysis, payload: currentPayload });
+        };
+      })
+      .catch(() => {
+        // Fallback to background worker message
+        chrome.runtime.sendMessage({
+          type: "ONESTOP_COMPARE_CROSS_STORE",
+          payload: currentPayload,
+          requestUrl: activeUrl,
+        });
+      });
   }
 
   // ── Extraction Orchestration & Hydration Wait ──

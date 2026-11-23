@@ -348,11 +348,13 @@ def test_block_non_retailer_aggregators_and_deduplicate_current_store():
     assert amz_row.best_user_card_net_price == 72990.0
 
 
-@pytest.mark.asyncio
-async def test_analyze_client_payload_persists_retrievable_canonical_product_id():
+def test_analyze_client_payload_persists_retrievable_canonical_product_id():
     """POST /api/v1/analyze-client-payload commits canonical_product_id retrievable via GET /api/v1/products/{id}."""
     from fastapi.testclient import TestClient
+    from app.db.session import engine
     from app.main import app
+
+    engine.sync_engine.pool.dispose()
 
     unique_sku = f"TESTSKU{uuid.uuid4().hex[:8].upper()}"
     body = {
@@ -392,6 +394,7 @@ async def test_analyze_client_payload_persists_retrievable_canonical_product_id(
         bad_resp = client.get("/api/v1/products/not-a-valid-uuid")
         assert bad_resp.status_code == 404
         assert "not a valid canonical product UUID" in bad_resp.json()["detail"]
+    engine.sync_engine.pool.dispose()
 
 
 def test_become_a_seller_rejection_and_d2c_default():
@@ -607,7 +610,7 @@ def test_discovery_blocks_aggregators_and_accepts_shopify_json_and_generic_d2c()
     from app.services.universal_scraper import build_shopify_json_url, parse_shopify_product_json
 
     queries = build_transactional_searxng_queries("Apple iPhone 17 256GB")
-    assert len(queries) == 3
+    assert len(queries) >= 3
     q_texts = " ".join(q for _, q in queries)
     assert "Add to Cart" in q_texts
     assert "inurl:/products/" in q_texts

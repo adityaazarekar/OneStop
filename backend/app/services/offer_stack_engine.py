@@ -383,14 +383,15 @@ def compute_cash_vs_points_report(
     price_after_coupon = max(0.0, round(listed_price - coupon_disc, 2))
     base_payable_no_bank = max(0.0, round(listed_price - coupon_disc + mandatory_fees, 2))
 
-    # Map ONLY genuinely verified rules (live_tc_verified or page_verified)
+    # Map ONLY genuinely verified rules (live_tc_verified, issuer_tc_verified, or page_verified)
     rule_by_name: dict[str, VerifiedPaymentRule] = {}
     voucher_rule: VerifiedPaymentRule | None = None
     upi_rule: VerifiedPaymentRule | None = None
     latest_verified: datetime | None = None
+    verified_statuses = ("live_tc_verified", "issuer_tc_verified", "page_verified")
 
     for r in verified_rules or []:
-        if r.verification_status not in ("live_tc_verified", "page_verified"):
+        if r.verification_status not in verified_statuses:
             continue
         rule_by_name[r.method_name.lower()] = r
         if r.method_type == "gift_voucher" and voucher_rule is None:
@@ -407,7 +408,15 @@ def compute_cash_vs_points_report(
         instant_disc, matched_offer = _best_verified_instant_discount(card, bank_offers, price_after_coupon)
         payable_today = max(0.0, round(listed_price - coupon_disc - instant_disc + mandatory_fees, 2))
 
-        if rule.verification_status in ("live_tc_verified", "page_verified"):
+        # Mutual-exclusion guard: if an instant bank discount is applied AND the card's verified T&C exclusions
+        # state that instant discount transactions do not earn base reward points/cashback, do not stack them.
+        excl_blob = " ".join(rule.exclusions or []).lower()
+        instant_excludes_base_rewards = instant_disc > 0 and any(
+            phrase in excl_blob
+            for phrase in ("no reward points on instant discount", "excludes instant discount", "not stackable with instant discount")
+        )
+
+        if rule.verification_status in verified_statuses and not instant_excludes_base_rewards:
             rewards = _evaluate_rule_rewards(payable_today, rule)
         else:
             rewards = PostPurchaseRewards(reward_type="none")
@@ -418,11 +427,11 @@ def compute_cash_vs_points_report(
             round(payable_today + rewards.processing_fee_inr - max(rewards.cash_value_inr, rewards.travel_value_inr), 2),
         )
 
-        if matched_offer and rule.verification_status == "live_tc_verified":
-            ver_status = "live_tc_verified"
+        if matched_offer and rule.verification_status in ("live_tc_verified", "issuer_tc_verified"):
+            ver_status = rule.verification_status
         elif matched_offer:
             ver_status = "page_verified"
-        elif rule.verification_status in ("live_tc_verified", "page_verified"):
+        elif rule.verification_status in verified_statuses:
             ver_status = rule.verification_status
         else:
             ver_status = "no_verified_offer"
@@ -433,7 +442,7 @@ def compute_cash_vs_points_report(
         summary_parts: list[str] = []
         if matched_offer:
             summary_parts.append(f"Live Page Instant Discount: -₹{instant_disc:,.0f} ({matched_offer.summary})")
-        if rule.verification_status in ("live_tc_verified", "page_verified") and rule.plain_english_summary:
+        if rule.verification_status in verified_statuses and rule.plain_english_summary:
             summary_parts.append(rule.plain_english_summary)
         if not summary_parts:
             summary_parts.append("No active verified offer found")

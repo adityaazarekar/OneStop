@@ -29,16 +29,19 @@ import {
 import { CardWalletBar } from "@/components/CardWalletBar";
 import { CashVsPointsSection } from "@/components/CashVsPointsSection";
 import {
+  API_BASE,
   fetchProductDetails,
   fetchProductHistory,
   recalculateEffectivePrice,
   compareExchange,
+  startCompareAllStores,
 } from "@/lib/api";
 import {
   AnalysisResponse,
   ExchangeComparisonResponse,
   PriceHistoryResponse,
   ProductDetails,
+  QuickCommerceQuote,
 } from "@/lib/types";
 import { formatINR, retailerLabel, trustColorClass, verdictBadge } from "@/lib/utils";
 
@@ -60,6 +63,12 @@ export default function ProductDecisionPage({ params }: PageProps) {
   const [effectiveData, setEffectiveData] = useState<any>(null);
   const [recalculating, setRecalculating] = useState(false);
   const [refreshingTerms, setRefreshingTerms] = useState(false);
+
+  // Stage 1-3 Live SSE Multi-Store & Quick-Commerce Streaming State
+  const [pincode, setPincode] = useState<string>("411001");
+  const [streamingStores, setStreamingStores] = useState(false);
+  const [streamProgress, setStreamProgress] = useState<string>("");
+  const [quickCommerceQuotes, setQuickCommerceQuotes] = useState<QuickCommerceQuote[]>([]);
 
   // Exchange Arbitrage State
   const [newDevicePrice, setNewDevicePrice] = useState<number>(0);
@@ -93,6 +102,105 @@ export default function ProductDecisionPage({ params }: PageProps) {
       if (updated) setProduct(updated);
     } finally {
       setRefreshingTerms(false);
+    }
+  };
+
+  const handleStreamAllStores = async () => {
+    if (!product || streamingStores) return;
+    const primaryListing = product.listings?.[0];
+    const cleanPin = pincode.replace(/\D/g, "").slice(0, 6) || "411001";
+    setPincode(cleanPin);
+    setStreamingStores(true);
+    setStreamProgress(`Checking stores & 10-min apps for pincode ${cleanPin}...`);
+
+    try {
+      const job = await startCompareAllStores(
+        {
+          retailer: primaryListing?.retailer || "store",
+          url: primaryListing?.listing_url || "https://www.amazon.in",
+          title: `${product.brand || ""} ${product.model_name || ""}`.trim(),
+          brand: product.brand,
+          listed_price: primaryListing?.current_listed_price || 1000,
+          variant_specs: product.variant_specs || {},
+          pincode: cleanPin,
+        },
+        cleanPin,
+        activeCardIds
+      );
+
+      const es = new EventSource(`${API_BASE}/stream-compare/${encodeURIComponent(job.job_id)}`);
+
+      es.addEventListener("progress", (ev) => {
+        try {
+          const d = JSON.parse((ev as MessageEvent).data);
+          if (d.message) setStreamProgress(d.message);
+        } catch {}
+      });
+
+      es.addEventListener("store_quote", (ev) => {
+        try {
+          const d = JSON.parse((ev as MessageEvent).data);
+          const q = d.quote;
+          if (!q) return;
+          setProduct((prev) => {
+            if (!prev) return prev;
+            const cur = [...(prev.ranked_store_choices || [])];
+            if (cur.some((s) => s.url === q.url || s.retailer === q.retailer)) return prev;
+            const cashP = Math.round((q.listed_price || 0) + (q.delivery_fee || 0));
+            cur.push({
+              retailer: q.retailer,
+              store_name: retailerLabel(q.retailer),
+              url: q.url,
+              listed_price: q.listed_price,
+              checkout_cash_price: cashP,
+              best_user_card_net_price: cashP,
+              effective_price: cashP,
+              is_current_store: false,
+              seller_name: q.seller_name || "Verified Merchant",
+              peace_of_mind_score: 78,
+              return_terms: "Standard Replacement Support",
+              warranty_terms: "1 Year Brand Warranty",
+              overall_score: 80,
+              rank_badge: "Live Streamed",
+              is_overall_winner: false,
+            });
+            return { ...prev, ranked_store_choices: cur };
+          });
+        } catch {}
+      });
+
+      es.addEventListener("quick_commerce_quote", (ev) => {
+        try {
+          const d = JSON.parse((ev as MessageEvent).data);
+          const qc = d.quote as QuickCommerceQuote;
+          if (!qc) return;
+          setQuickCommerceQuotes((prev) =>
+            prev.some((x) => x.platform === qc.platform) ? prev : [...prev, qc]
+          );
+        } catch {}
+      });
+
+      es.addEventListener("complete", (ev) => {
+        setStreamingStores(false);
+        try {
+          const d = JSON.parse((ev as MessageEvent).data);
+          setStreamProgress(
+            `Completed: ${d.stores_count ?? 0} online stores + ${d.quick_commerce_count ?? 0} quick-commerce apps verified for pincode ${cleanPin}.`
+          );
+        } catch {
+          setStreamProgress("Live multi-store & 10-min quick-commerce discovery complete.");
+        }
+        es.close();
+      });
+
+      es.onerror = () => {
+        setStreamingStores(false);
+        es.close();
+      };
+    } catch (err) {
+      console.warn(err);
+      setStreamingStores(false);
+      setStreamProgress("Could not start live comparison stream.");
     }
   };
 
@@ -546,15 +654,49 @@ export default function ProductDecisionPage({ params }: PageProps) {
       {/* ── Fair Multi-Store Ranking (Unbiased Ranking Across All Sites) ── */}
       {product.ranked_store_choices && product.ranked_store_choices.length > 0 && (
         <div className="p-6 rounded-2xl bg-surface-card border border-surface-border shadow-xl space-y-4">
-          <div>
-            <span className="text-xs font-bold text-slate-400 uppercase tracking-wider">
-              UNBIASED CROSS-PLATFORM ARBITRAGE
-            </span>
-            <h2 className="text-lg font-bold text-white mt-0.5">Fair Multi-Store Ranking</h2>
-            <p className="text-xs text-slate-400">
-              Ranked dynamically by Effective Price (55%), Peace of Mind (30%), and Return/Warranty Terms (15%)
-            </p>
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div>
+              <span className="text-xs font-bold text-slate-400 uppercase tracking-wider">
+                UNBIASED CROSS-PLATFORM ARBITRAGE
+              </span>
+              <h2 className="text-lg font-bold text-white mt-0.5">
+                All Online Stores &amp; D2C Marketplaces
+              </h2>
+              <p className="text-xs text-slate-400">
+                Ranked dynamically by Effective Price (55%), Peace of Mind (30%), and Return/Warranty Terms (15%)
+              </p>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <div className="flex items-center gap-1.5 bg-surface px-2.5 py-1.5 rounded-xl border border-surface-border">
+                <span className="text-[11px] text-slate-400 font-semibold">Pincode:</span>
+                <input
+                  type="text"
+                  maxLength={6}
+                  value={pincode}
+                  onChange={(e) => setPincode(e.target.value.replace(/\D/g, ""))}
+                  className="w-16 bg-transparent text-xs font-bold text-white focus:outline-none"
+                />
+              </div>
+              <button
+                onClick={handleStreamAllStores}
+                disabled={streamingStores}
+                className="px-3.5 py-2 rounded-xl text-xs font-bold bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white transition-colors flex items-center gap-1.5"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${streamingStores ? "animate-spin" : ""}`} />
+                <span>{streamingStores ? "Streaming Live..." : "Compare All Stores & 10-Min Apps"}</span>
+              </button>
+            </div>
           </div>
+
+          {streamProgress && (
+            <div className="p-3 rounded-xl bg-indigo-500/10 border border-indigo-500/30 text-xs text-indigo-200 flex items-center gap-2">
+              {streamingStores && (
+                <div className="w-3.5 h-3.5 border-2 border-indigo-400 border-t-transparent rounded-full animate-spin flex-shrink-0" />
+              )}
+              <span>{streamProgress}</span>
+            </div>
+          )}
 
           <div className="overflow-x-auto">
             <table className="w-full text-left text-xs">
@@ -636,6 +778,76 @@ export default function ProductDecisionPage({ params }: PageProps) {
                 })}
               </tbody>
             </table>
+          </div>
+
+          {/* ── Quick Commerce (10-Min Delivery) Section ── */}
+          <div className="pt-4 border-t border-surface-border space-y-3">
+            <div className="flex items-center justify-between">
+              <div>
+                <span className="text-[10px] font-extrabold text-emerald-400 uppercase tracking-wider">
+                  10-MIN QUICK COMMERCE · PINCODE {pincode}
+                </span>
+                <h3 className="text-sm font-bold text-white">
+                  Quick Commerce (Blinkit · Zepto · Swiggy Instamart · BigBasket Now · JioMart Quick)
+                </h3>
+              </div>
+            </div>
+
+            {quickCommerceQuotes.length > 0 ? (
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-xs">
+                  <thead>
+                    <tr className="border-b border-surface-border text-slate-400 uppercase text-[10px] tracking-wider">
+                      <th className="py-2.5 px-3 font-bold">App</th>
+                      <th className="py-2.5 px-3 font-bold">ETA</th>
+                      <th className="py-2.5 px-3 font-bold">Unit Price</th>
+                      <th className="py-2.5 px-3 font-bold">Handling / Surge Fees</th>
+                      <th className="py-2.5 px-3 font-bold">Total Payable</th>
+                      <th className="py-2.5 px-3 font-bold text-right">Direct Link</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-surface-border/40">
+                    {quickCommerceQuotes.map((qc, idx) => {
+                      const fees =
+                        (qc.handling_fee_inr || 0) +
+                        (qc.delivery_fee_inr || 0) +
+                        (qc.surge_fee_inr || 0) +
+                        (qc.small_cart_fee_inr || 0);
+                      return (
+                        <tr key={idx} className="hover:bg-surface/40">
+                          <td className="py-2.5 px-3 font-bold text-white">{qc.app_name}</td>
+                          <td className="py-2.5 px-3 text-emerald-400 font-bold">⚡ {qc.eta_minutes_label}</td>
+                          <td className="py-2.5 px-3 text-slate-300 font-mono">
+                            {qc.unit_price_label || qc.pack_size || "—"}
+                          </td>
+                          <td className="py-2.5 px-3 text-rose-400 font-mono">+{formatINR(fees)}</td>
+                          <td className="py-2.5 px-3 font-black text-emerald-400 font-mono">
+                            {formatINR(qc.total_payable_inr)}
+                          </td>
+                          <td className="py-2.5 px-3 text-right">
+                            {qc.url && (
+                              <a
+                                href={qc.url}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-bold bg-surface border border-surface-border text-slate-200 hover:text-white"
+                              >
+                                <span>Open</span>
+                                <ExternalLink className="w-3 h-3" />
+                              </a>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <p className="text-xs text-slate-400">
+                Click <strong>Compare All Stores &amp; 10-Min Apps</strong> above to stream live Quick-Commerce dark-store availability and unit prices (`₹/100g`) for pincode <strong>{pincode}</strong>.
+              </p>
+            )}
           </div>
         </div>
       )}

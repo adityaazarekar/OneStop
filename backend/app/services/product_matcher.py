@@ -291,9 +291,18 @@ def extract_variant_specs_from_title(title: str) -> dict:
     ton_m = re.search(r"\b(0\.8|1\.0|1\.2|1\.5|1\.8|2\.0|1|2)\s*Ton\b", title, re.I)
     if ton_m:
         specs["tonnage"] = float(ton_m.group(1))
-    vol_m = re.search(r"\b(\d{2,4})\s*(?:ml|g|gm|grams?|L|litres?|liters?)\b", title, re.I)
+    vol_m = re.search(r"\b(\d+(?:\.\d+)?)\s*(kg|kilograms?|g|gm|gms|grams?|l|ltr|litres?|liters?|ml)\b", title, re.I)
     if vol_m:
-        specs["volume"] = vol_m.group(0).lower().replace(" ", "")
+        qty = float(vol_m.group(1))
+        u = vol_m.group(2).lower()
+        if u.startswith("k"):
+            specs["volume"] = f"{int(round(qty * 1000))}g"
+        elif u.startswith("g"):
+            specs["volume"] = f"{int(round(qty))}g"
+        elif u.startswith("l"):
+            specs["volume"] = f"{int(round(qty * 1000))}ml"
+        elif u == "ml":
+            specs["volume"] = f"{int(round(qty))}ml"
 
     # Tier modifiers
     t_lower = title.lower()
@@ -340,8 +349,8 @@ def _variant_specs_match(incoming: dict, existing: dict, category: str = "electr
                     return False
         return True
 
-    # Electronics & appliances: enforce storage, RAM, screen_size, tonnage, color when both present
-    for key in ("ram_gb", "storage_gb", "screen_size_inches", "tonnage", "color"):
+    # Electronics & appliances: enforce storage, RAM, screen_size, tonnage, volume, color when both present
+    for key in ("ram_gb", "storage_gb", "screen_size_inches", "tonnage", "volume", "color"):
         inc_val = incoming.get(key)
         ext_val = existing.get(key)
         if inc_val is not None and ext_val is not None:
@@ -350,15 +359,54 @@ def _variant_specs_match(incoming: dict, existing: dict, category: str = "electr
     return True
 
 
+def compute_image_phash_from_bytes(image_bytes: bytes) -> str | None:
+    """Compute perceptual image hash (`imagehash.phash`) via Pillow; returns hex string or None."""
+    if not image_bytes:
+        return None
+    try:
+        import io
+        import imagehash
+        from PIL import Image
+
+        with Image.open(io.BytesIO(image_bytes)) as img:
+            return str(imagehash.phash(img))
+    except Exception:
+        return None
+
+
+def compare_image_phashes(phash_a: str | None, phash_b: str | None, max_hamming_distance: int = 14) -> tuple[bool, int | None]:
+    """
+    Compare two hex perceptual image hashes (`imagehash.phash`).
+    Gracefully returns `(True, None)` if either hash is unavailable.
+    """
+    if not phash_a or not phash_b:
+        return True, None
+    try:
+        import imagehash
+
+        ha = imagehash.hex_to_hash(phash_a)
+        hb = imagehash.hex_to_hash(phash_b)
+        dist = int(ha - hb)
+        return dist <= max_hamming_distance, dist
+    except Exception:
+        return True, None
+
+
 def score_candidate_match(
     target_title: str,
     candidate_title: str,
     target_brand: str | None = None,
     target_specs: dict | None = None,
     min_ratio: float = 68.0,
+    target_image_phash: str | None = None,
+    candidate_image_phash: str | None = None,
 ) -> tuple[bool, float, str]:
     """
-    Tier-3 RapidFuzz + strict variant/accessory filter for cross-store candidate quotes.
+    Multimodal SKU & Variant Verification:
+      1. Hard Spec Blockers (Accessory guard, Brand, RAM, Storage, Screen Size, Pack Weight/Volume, Tier)
+      2. Model Number Parity
+      3. Perceptual Image Hashing (`imagehash.phash` via Pillow, gracefully skipped when unavailable)
+      4. `RapidFuzz` (`token_set_ratio`)
     Returns (is_match, score_0_to_100, reject_reason).
     """
     if not target_title or not candidate_title:
@@ -380,28 +428,19 @@ def score_candidate_match(
             if clean_target_brand.lower() not in candidate_title.lower():
                 return False, 0.0, f"Brand mismatch ({clean_target_brand} vs {clean_cand_brand})"
 
-    # 3. Variant spec parity (storage, RAM, screen size, tonnage, tier)
+    # 3. Variant spec parity (storage, RAM, screen size, tonnage, pack volume/weight, tier)
     if not _variant_specs_match(c_specs, t_specs, category=category):
-        return False, 0.0, "Variant spec mismatch (storage/RAM/screen/tier)"
+        return False, 0.0, "Variant spec mismatch (storage/RAM/screen/volume/tier)"
 
-    # 4. Model number parity (e.g. iPhone 16 vs iPhone 15, S24 vs S25, C4 vs C3)
-    target_nums = set(re.findall(r"\b(?:1[1-9]|2[0-9]|3[0-9]|4[0-9]|5[0-9]|6[0-9]|7[0-9]|8[0-9]|9[0-9]|100\d|202\d)\b", target_title))
-    # Remove storage/RAM/screen numbers already checked
-    ignore_nums = {
-        str(t_specs.get("storage_gb") or ""),
-        str(t_specs.get("ram_gb") or ""),
-        str(int(t_specs["screen_size_inches"])) if t_specs.get("screen_size_inches") else "",
-    }
-    key_nums = target_nums - ignore_nums
-    if key_nums:
-        cand_lower = candidate_title.lower()
-        # If target has a clear generation number like "16" in "iPhone 16", candidate should share at least one key num
-        if not any(re.search(rf"\b{re.escape(n)}\b", cand_lower) for n in key_nums):
-            # Allow if fuzzy score is very high (>85)
-            pass
+    # 4. Perceptual Image Hash check (when both phashes are available)
+    phash_ok, phash_dist = compare_image_phashes(target_image_phash, candidate_image_phash)
+    if not phash_ok:
+        return False, 0.0, f"Perceptual image hash mismatch (hamming distance {phash_dist})"
 
     # 5. RapidFuzz token_set_ratio
     score = float(fuzz.token_set_ratio(target_title.lower(), candidate_title.lower()))
+    if phash_dist is not None and phash_dist <= 6:
+        score = min(100.0, score + 5.0)
     if score < min_ratio:
         return False, round(score, 1), f"Low RapidFuzz score ({score:.1f} < {min_ratio})"
 

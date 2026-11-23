@@ -12,6 +12,7 @@ import uuid
 from datetime import date, datetime, timezone
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from fastapi.responses import StreamingResponse
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -32,6 +33,8 @@ from app.schemas.extraction import (
     CardResultResponse,
     CashVsPointsReport,
     ClientPayload,
+    CompareAllStoresRequest,
+    CompareAllStoresResponse,
     CompetitorQuote,
     DiscoverStoresRequest,
     DiscoverStoresResponse,
@@ -45,6 +48,7 @@ from app.schemas.extraction import (
     LiveOfferRaw,
     MissedSavingResponse,
     MultiSellerReport,
+    QuickCommerceQuote,
     ScraperResult,
     StackedEffectivePriceResult,
     StoreRankingChoice,
@@ -65,6 +69,12 @@ from app.services.offer_stack_engine import (
     compute_stacked_offer_price,
 )
 from app.services.product_matcher import match_or_create
+from app.services.quick_commerce_engine import (
+    build_qc_quote_from_payload,
+    detect_qc_platform_key,
+    discover_quick_commerce_quotes,
+    sanitize_pincode,
+)
 from app.services.seller_forensics import analyze_dynamic_sellers, compute_trust_score
 from app.services.shopping_discovery import discover_stores
 from app.services.store_ranker import rank_stores_fairly
@@ -74,6 +84,7 @@ from app.services.vault_service import (
     get_vault_items,
     process_invoice,
 )
+from app.worker import launch_compare_all_stores_job, stream_job_events
 
 router = APIRouter(prefix="/api/v1", tags=["v1"])
 
@@ -540,6 +551,13 @@ async def _run_analysis_pipeline(
             ],
         )
 
+    qc_quotes: list[QuickCommerceQuote] = []
+    qc_key = detect_qc_platform_key(payload.url) or detect_qc_platform_key(payload.retailer)
+    if qc_key:
+        qc_q = build_qc_quote_from_payload(payload, pincode=payload.pincode or "411001", platform_key=qc_key)
+        if qc_q:
+            qc_quotes.append(qc_q)
+
     return AnalysisResponse(
         canonical_product_id=str(product.id),
         brand=product.brand,
@@ -580,6 +598,7 @@ async def _run_analysis_pipeline(
         stacked_offers=stacked_offers,
         seller_report=multi_seller_report,
         ranked_store_choices=ranked_store_choices,
+        quick_commerce_quotes=qc_quotes,
         llm_summary=exec_summary,
         cash_vs_points=cash_vs_points,
     )
@@ -592,8 +611,60 @@ async def _run_analysis_pipeline(
 
 @router.post("/discover-stores", response_model=DiscoverStoresResponse)
 async def discover_stores_endpoint(req: DiscoverStoresRequest):
-    """Stage 2 universal cross-store discovery via SearXNG + 3-Tier Scrapling + RapidFuzz."""
-    return await discover_stores(req.payload, max_stores=req.max_stores)
+    """Stage 2/3 universal cross-store + quick-commerce discovery via SearXNG + 4-Tier Scrapling + RapidFuzz."""
+    pin = sanitize_pincode(req.pincode or req.payload.pincode)
+    stores_res, qc_quotes = await asyncio.gather(
+        discover_stores(req.payload, max_stores=req.max_stores),
+        discover_quick_commerce_quotes(req.payload, pincode=pin),
+        return_exceptions=True,
+    )
+    if isinstance(stores_res, DiscoverStoresResponse):
+        if isinstance(qc_quotes, list):
+            stores_res.quick_commerce_quotes = qc_quotes
+        return stores_res
+    return DiscoverStoresResponse(
+        query=req.payload.title,
+        quotes=[],
+        quick_commerce_quotes=qc_quotes if isinstance(qc_quotes, list) else [],
+        errors=[str(stores_res)],
+    )
+
+
+@router.post("/compare-all-stores", response_model=CompareAllStoresResponse)
+async def compare_all_stores_endpoint(req: CompareAllStoresRequest):
+    """
+    Stage 1 Fast Async Enqueue (<150ms):
+    Immediately returns `{ "job_id": "...", "pincode": "...", "cached_stores": [...] }`
+    and triggers Universal Store Discovery + Quick-Commerce Compare concurrently in the background.
+    Stream progressive results via `GET /api/v1/stream-compare/{job_id}`.
+    """
+    job_id = uuid.uuid4().hex
+    pin = sanitize_pincode(req.pincode or req.payload.pincode)
+    await launch_compare_all_stores_job(job_id, req.payload, pincode=pin)
+    return CompareAllStoresResponse(
+        job_id=job_id,
+        pincode=pin,
+        cached_stores=[],
+        cached_quick_commerce=[],
+    )
+
+
+@router.get("/stream-compare/{job_id}")
+async def stream_compare_endpoint(job_id: str):
+    """
+    Stage 1 Server-Sent Events (SSE) endpoint (`text/event-stream`):
+    Streams each newly verified universal store (`event: store_quote`), quick-commerce app
+    (`event: quick_commerce_quote`), and final completion summary (`event: complete`).
+    """
+    return StreamingResponse(
+        stream_job_events(job_id),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.post("/analyze-client-payload", response_model=AnalysisResponse)
