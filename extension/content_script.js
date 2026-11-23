@@ -159,6 +159,7 @@
   let isComparing = false;
   let streamProgressMsg = "";
   let userPincode = "411001";
+  let storeSortMode = "cheapest"; // "cheapest" | "fastest"
   let activeCompareEventSource = null;
   let activeUrl = "";
   let activeRequestId = 0;
@@ -558,6 +559,7 @@
             <div class="os-tier-meta">
               <div class="os-row"><span>Verified Instant Bank Discount</span><strong style="color:${cvp.instant_bank_discount_inr > 0 ? '#059669' : '#64748b'};">-${fmt(cvp.instant_bank_discount_inr)}</strong></div>
               ${cvp.winning_instant_offer_summary ? `<div style="font-size:10.5px;color:#047857;">✓ ${esc(cvp.winning_instant_offer_summary)}</div>` : ""}
+              ${cvp.requires_offer_verification && cvp.instant_bank_discount_inr === 0 ? `<div style="font-size:10.5px;color:#b45309;margin-top:2px;">⚠️ ${esc(cvp.offer_verification_note || "Conditional 'up to' offers require offer-drawer/T&C verification and are not deducted upfront.")}</div>` : ""}
               ${cvp.coupon_discount_inr > 0 ? `<div class="os-row"><span>Verified Coupon</span><strong style="color:#059669;">-${fmt(cvp.coupon_discount_inr)}</strong></div>` : ""}
               ${cvp.mandatory_fees_inr > 0 ? `<div class="os-row"><span>Mandatory Fees</span><strong style="color:#dc2626;">+${fmt(cvp.mandatory_fees_inr)}</strong></div>` : ""}
               ${cvp.user_wallet_empty ? `<div style="font-size:10.5px;color:#b45309;margin-top:2px;">Tip: Select your cards in the OneStop popup to match instant bank offers.</div>` : ""}
@@ -679,31 +681,81 @@
 
     const ranked = a.ranked_store_choices || [];
     if (ranked.length > 0) {
+      const parseEtaScore = (st) => {
+        if (st.in_stock === false) return 999999;
+        const eta = String(st.eta_label || "").toLowerCase();
+        if (eta.includes("min")) return 10;
+        if (eta.includes("1-2") || eta.includes("today")) return 120;
+        return 360;
+      };
+      const sortBucketList = (list) => {
+        return [...list].sort((x, y) => {
+          if (storeSortMode === "fastest") {
+            const diff = parseEtaScore(x) - parseEtaScore(y);
+            if (diff !== 0) return diff;
+          }
+          const px = x.best_user_card_net_price || x.effective_price || x.listed_price || 99999999;
+          const py = y.best_user_card_net_price || y.effective_price || y.listed_price || 99999999;
+          return px - py;
+        });
+      };
+
+      const exactMatches = sortBucketList(ranked.filter((s) => (s.store_bucket || "exact_match") === "exact_match" && s.in_stock !== false));
+      const lesserKnown = sortBucketList(ranked.filter((s) => s.store_bucket === "lesser_known_store" || ((s.store_bucket || "exact_match") === "exact_match" && s.in_stock === false)));
+      const variantMismatches = sortBucketList(ranked.filter((s) => s.store_bucket === "variant_mismatch"));
+
+      const renderBucketRows = (items, isMismatchBucket) => items.map((st) => {
+        const href = safeHref(st.url);
+        const cashP = st.checkout_cash_price || st.listed_price;
+        const netP = st.best_user_card_net_price || st.effective_price;
+        const outOfStock = st.in_stock === false;
+        const diffBadges = (st.variant_diff_badges || []).map((b) => `<span class="os-badge os-badge-est" style="margin-left:3px;">⚠️ ${esc(b)}</span>`).join("");
+        return `
+          <tr class="${st.is_overall_winner && !outOfStock && !isMismatchBucket ? "os-win" : ""}">
+            <td>
+              <strong>${esc(st.store_name)}</strong>
+              ${st.is_current_store ? `<span class="os-badge os-badge-current">Current Page</span>` : ""}
+              ${st.is_overall_winner && !outOfStock && !isMismatchBucket ? `<span class="os-badge os-badge-page" style="margin-left:3px;">🏆 Lowest after offers</span>` : ""}
+              ${outOfStock ? `<span class="os-badge os-badge-cap" style="margin-left:3px;">Out of stock</span>` : ""}
+              ${diffBadges}
+              <div style="font-size:10px;color:#64748b;">${esc(st.seller_name)} · Trust ${esc(st.peace_of_mind_score)}/100 · ${esc(st.eta_label || "2-4 days")}</div>
+            </td>
+            <td><strong>${fmt(cashP)}</strong></td>
+            <td style="color:#047857;"><strong>${fmt(netP)}</strong></td>
+            <td>${st.is_current_store ? `<span style="font-size:10.5px;color:#64748b;">Here</span>` : (href ? `<a href="${href}" target="_blank" rel="noopener noreferrer" class="os-link">Open →</a>` : "—")}</td>
+          </tr>`;
+      }).join("");
+
       bodyHtml += `
+        <div class="os-row" style="margin-bottom:6px;align-items:center;">
+          <span style="font-size:11px;font-weight:700;color:#334155;">${ranked.length} store${ranked.length > 1 ? "s" : ""} found</span>
+          <div style="display:flex;gap:4px;">
+            <button id="osSortCheapest" style="padding:3px 8px;border-radius:6px;border:1px solid ${storeSortMode === "cheapest" ? "#4f46e5" : "#cbd5e1"};background:${storeSortMode === "cheapest" ? "#eef2ff" : "#fff"};color:${storeSortMode === "cheapest" ? "#4f46e5" : "#475569"};font-size:10.5px;font-weight:700;cursor:pointer;">₹ Cheapest</button>
+            <button id="osSortFastest" style="padding:3px 8px;border-radius:6px;border:1px solid ${storeSortMode === "fastest" ? "#4f46e5" : "#cbd5e1"};background:${storeSortMode === "fastest" ? "#eef2ff" : "#fff"};color:${storeSortMode === "fastest" ? "#4f46e5" : "#475569"};font-size:10.5px;font-weight:700;cursor:pointer;">⚡ Fastest</button>
+          </div>
+        </div>
         <div class="os-table-wrap">
+          <div style="font-size:10.5px;font-weight:800;color:#047857;text-transform:uppercase;margin:4px 0;">Exact Matches (${exactMatches.length})</div>
           <table class="os-table">
             <thead>
               <tr><th>Store</th><th>Checkout Cash</th><th>Your Card Net</th><th>Link</th></tr>
             </thead>
             <tbody>
-              ${ranked.map((st) => {
-                const href = safeHref(st.url);
-                const cashP = st.checkout_cash_price || st.listed_price;
-                const netP = st.best_user_card_net_price || st.effective_price;
-                return `
-                  <tr class="${st.is_overall_winner ? "os-win" : ""}">
-                    <td>
-                      <strong>${esc(st.store_name)}</strong>
-                      ${st.is_current_store ? `<span class="os-badge os-badge-current">Current Page</span>` : ""}
-                      <div style="font-size:10px;color:#64748b;">${esc(st.seller_name)} · Trust ${esc(st.peace_of_mind_score)}/100</div>
-                    </td>
-                    <td><strong>${fmt(cashP)}</strong></td>
-                    <td style="color:#047857;"><strong>${fmt(netP)}</strong></td>
-                    <td>${st.is_current_store ? `<span style="font-size:10.5px;color:#64748b;">Here</span>` : (href ? `<a href="${href}" target="_blank" rel="noopener noreferrer" class="os-link">Open →</a>` : "—")}</td>
-                  </tr>`;
-              }).join("")}
+              ${exactMatches.length > 0 ? renderBucketRows(exactMatches, false) : `<tr><td colspan="4" style="color:#64748b;">No confirmed in-stock exact matches yet.</td></tr>`}
             </tbody>
           </table>
+          ${lesserKnown.length > 0 ? `
+            <div style="font-size:10.5px;font-weight:800;color:#1d4ed8;text-transform:uppercase;margin:8px 0 4px;">Lesser-Known &amp; Specialty Stores (${lesserKnown.length})</div>
+            <table class="os-table">
+              <tbody>${renderBucketRows(lesserKnown, false)}</tbody>
+            </table>
+          ` : ""}
+          ${variantMismatches.length > 0 ? `
+            <div style="font-size:10.5px;font-weight:800;color:#b45309;text-transform:uppercase;margin:8px 0 4px;">May Not Be the Exact Item (${variantMismatches.length})</div>
+            <table class="os-table">
+              <tbody>${renderBucketRows(variantMismatches, true)}</tbody>
+            </table>
+          ` : ""}
         </div>`;
     }
 
@@ -796,6 +848,14 @@
     `;
 
     shadow.getElementById("osClose")?.addEventListener("click", () => drawer.classList.remove("os-open"));
+    shadow.getElementById("osSortCheapest")?.addEventListener("click", () => {
+      storeSortMode = "cheapest";
+      renderResult(data);
+    });
+    shadow.getElementById("osSortFastest")?.addEventListener("click", () => {
+      storeSortMode = "fastest";
+      renderResult(data);
+    });
     const pinInput = shadow.getElementById("osPincodeInput");
     if (pinInput) {
       pinInput.addEventListener("change", (ev) => {
@@ -864,11 +924,15 @@
                   checkout_cash_price: cashP,
                   best_user_card_net_price: cashP,
                   effective_price: cashP,
+                  in_stock: q.in_stock !== false,
                   is_current_store: false,
                   seller_name: q.seller_name || "Verified Store",
                   peace_of_mind_score: 78,
                   rank_badge: "Live Verified",
                   is_overall_winner: false,
+                  store_bucket: q.store_bucket || (q.in_stock === false ? "lesser_known_store" : "exact_match"),
+                  variant_diff_badges: q.variant_diff_badges || [],
+                  eta_label: q.eta_label || (q.in_stock === false ? "Out of stock" : "2-4 days"),
                 });
                 currentAnalysis.ranked_store_choices = list;
                 streamProgressMsg = `Verified ${retailerLabel(q.retailer)} (${fmt(cashP)})...`;

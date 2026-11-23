@@ -181,7 +181,7 @@ async def run_universal_store_discovery(
     )
     res = await discover_stores(
         payload,
-        max_stores=15,
+        max_stores=25,
         on_quote_callback=_on_store,
         redis_client=r,
     )

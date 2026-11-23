@@ -476,7 +476,7 @@ async def _run_analysis_pipeline(
             )
         ]
 
-    # 10. Fair Multi-Site Ranking (Uniform 2-metric comparison, deduplicated Current Page)
+    # 10. Fair Multi-Site Ranking (Uniform 2-metric comparison, deduplicated Current Page, 3-tier dynamic bucketing)
     cur_checkout_cash = cash_vs_points.checkout_payable_inr if cash_vs_points else listed
     cur_best_net = cash_vs_points.best_user_card_net_price_cash if cash_vs_points else cur_checkout_cash
     try:
@@ -492,38 +492,76 @@ async def _run_analysis_pipeline(
             existing_listings=listing_snaps,
             user_cards=user_cards,
             verified_rules=verified_rules,
+            target_title=payload.title,
+            target_brand=product.brand or payload.brand,
+            target_specs=product.variant_specs or payload.variant_specs,
+            current_in_stock=payload.in_stock,
         )
     except Exception as exc:
         logger.warning(f"Fair store ranking failed ({exc}) — using empty list")
         ranked_store_choices = []
 
-    # 11. Short LLM Executive Recommendation Summary ("Which Site, Seller & Offer to Pick")
-    best_store_choice = ranked_store_choices[0] if ranked_store_choices else None
+    # 11. Brutally Honest LLM Executive Recommendation Summary ("Which Site, Seller & Offer to Pick")
+    winner_choice = next((s for s in ranked_store_choices if s.is_overall_winner), None) or (
+        ranked_store_choices[0] if ranked_store_choices else None
+    )
     best_offer_str = (
-        stacked_offers.applied_offers[0]["title"]
-        if (stacked_offers and stacked_offers.applied_offers)
-        else (best_card.offer_summary if (best_card and best_card.offer_summary) else "Standard Payment Method")
+        cash_vs_points.winning_instant_offer_summary
+        if (cash_vs_points and cash_vs_points.winning_instant_offer_summary)
+        else (
+            stacked_offers.applied_offers[0]["title"]
+            if (stacked_offers and stacked_offers.applied_offers)
+            else (best_card.offer_summary if (best_card and best_card.offer_summary) else "Standard Upfront Checkout")
+        )
     )
     key_pros = [p for s in (multi_seller_report.sellers if multi_seller_report else []) for p in s.pros]
     key_cons = [c for s in (multi_seller_report.sellers if multi_seller_report else []) for c in s.cons]
 
-    best_store_name = best_store_choice.store_name if best_store_choice else (payload.retailer or "Store")
+    best_store_name = winner_choice.store_name if winner_choice else (payload.retailer or "Store")
     best_seller_name = (
-        (multi_seller_report.recommended_seller if multi_seller_report else None)
+        (winner_choice.seller_name if winner_choice else None)
+        or (multi_seller_report.recommended_seller if multi_seller_report else None)
         or payload.seller_name
         or "Official / Verified Seller"
     )
+    upfront_cash_price = (
+        winner_choice.checkout_cash_price
+        if (winner_choice and winner_choice.checkout_cash_price > 0)
+        else cur_checkout_cash
+    )
     final_price = (
-        best_store_choice.effective_price
-        if (best_store_choice and best_store_choice.effective_price is not None)
+        winner_choice.effective_price
+        if (winner_choice and winner_choice.effective_price is not None)
         else (stacked_offers.best_stacked_price if stacked_offers else listed)
     )
     peace_score = (
-        best_store_choice.peace_of_mind_score
-        if best_store_choice
+        winner_choice.peace_of_mind_score
+        if winner_choice
         else (trust_report.trust_score if trust_report else 70)
     )
     prod_title = f"{product.brand or ''} {product.model_name or ''}".strip() or (payload.title or "Product")
+
+    unowned_note: str | None = None
+    if cash_vs_points and cash_vs_points.unowned_card_routes:
+        top_u = cash_vs_points.unowned_card_routes[0]
+        if top_u.effective_cost_if_cash_inr < final_price:
+            unowned_note = (
+                f"Alternative (Card Not in Wallet): {top_u.method_name} pays ₹{top_u.checkout_payable_inr:,.0f} today "
+                f"and works out to ₹{top_u.effective_cost_if_cash_inr:,.0f} after rewards, but requires a card not in your wallet."
+            )
+
+    excluded_stores: list[str] = []
+    for st in ranked_store_choices:
+        if st.store_bucket == "variant_mismatch":
+            badges_str = ", ".join(st.variant_diff_badges[:2]) or "variant difference"
+            excluded_stores.append(f"{st.store_name} (unconfirmed variant: {badges_str})")
+        elif not st.in_stock:
+            excluded_stores.append(f"{st.store_name} (out of stock)")
+    excluded_note = (
+        f"Excluded from winning recommendation: {'; '.join(excluded_stores[:3])}."
+        if excluded_stores
+        else None
+    )
 
     try:
         exec_summary = await parser.generate_executive_summary(
@@ -535,6 +573,9 @@ async def _run_analysis_pipeline(
             peace_of_mind_score=peace_score,
             key_pros=key_pros,
             key_cons=key_cons,
+            checkout_payable_inr=upfront_cash_price,
+            unowned_option_note=unowned_note,
+            excluded_stores_note=excluded_note,
         )
     except Exception as exc:
         logger.warning(f"Executive summary generation failed ({exc}) — fallback")

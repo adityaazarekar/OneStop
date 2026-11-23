@@ -1246,19 +1246,26 @@ def payload_to_competitor_quote(
     match_score: float,
     extraction_tier: str,
     source: str = "searxng",
+    store_bucket: str = "exact_match",
+    variant_diff_badges: list[str] | None = None,
 ) -> CompetitorQuote:
     return CompetitorQuote(
         retailer=payload.retailer,
         title=payload.title,
         listed_price=payload.listed_price,
+        currency=getattr(payload, "currency", "INR") or "INR",
         url=payload.url,
         sku=payload.sku,
         in_stock=payload.in_stock,
+        is_transactional_store=getattr(payload, "is_transactional_store", True),
         seller_name=payload.seller_name,
         seller_rating=payload.seller_rating,
         delivery_fee=payload.delivery_fee,
         bank_offer_summary=payload.raw_bank_offers[0] if payload.raw_bank_offers else None,
         match_score=match_score,
         extraction_tier=extraction_tier,
+        image_url=payload.image_url,
         source=source,
+        store_bucket=store_bucket,  # type: ignore[arg-type]
+        variant_diff_badges=variant_diff_badges or [],
     )

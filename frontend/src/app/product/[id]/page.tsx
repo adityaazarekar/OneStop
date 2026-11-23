@@ -69,6 +69,7 @@ export default function ProductDecisionPage({ params }: PageProps) {
   const [streamingStores, setStreamingStores] = useState(false);
   const [streamProgress, setStreamProgress] = useState<string>("");
   const [quickCommerceQuotes, setQuickCommerceQuotes] = useState<QuickCommerceQuote[]>([]);
+  const [storeSortMode, setStoreSortMode] = useState<"cheapest" | "fastest">("cheapest");
 
   // Exchange Arbitrage State
   const [newDevicePrice, setNewDevicePrice] = useState<number>(0);
@@ -155,6 +156,7 @@ export default function ProductDecisionPage({ params }: PageProps) {
               checkout_cash_price: cashP,
               best_user_card_net_price: cashP,
               effective_price: cashP,
+              in_stock: q.in_stock !== false,
               is_current_store: false,
               seller_name: q.seller_name || "Verified Merchant",
               peace_of_mind_score: 78,
@@ -163,6 +165,9 @@ export default function ProductDecisionPage({ params }: PageProps) {
               overall_score: 80,
               rank_badge: "Live Streamed",
               is_overall_winner: false,
+              store_bucket: q.store_bucket || (q.in_stock === false ? "lesser_known_store" : "exact_match"),
+              variant_diff_badges: q.variant_diff_badges || [],
+              eta_label: q.eta_label || (q.in_stock === false ? "Out of stock" : "2-4 days"),
             });
             return { ...prev, ranked_store_choices: cur };
           });
@@ -657,17 +662,35 @@ export default function ProductDecisionPage({ params }: PageProps) {
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
             <div>
               <span className="text-xs font-bold text-slate-400 uppercase tracking-wider">
-                UNBIASED CROSS-PLATFORM ARBITRAGE
+                UNBIASED CROSS-PLATFORM ARBITRAGE · {product.ranked_store_choices.length} STORES FOUND
               </span>
               <h2 className="text-lg font-bold text-white mt-0.5">
                 All Online Stores &amp; D2C Marketplaces
               </h2>
               <p className="text-xs text-slate-400">
-                Ranked dynamically by Effective Price (55%), Peace of Mind (30%), and Return/Warranty Terms (15%)
+                Grouped into Exact Matches, Lesser-Known &amp; Specialty Stores, and Variant Mismatches
               </p>
             </div>
 
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <div className="flex items-center gap-1 bg-surface p-1 rounded-xl border border-surface-border">
+                <button
+                  onClick={() => setStoreSortMode("cheapest")}
+                  className={`px-2.5 py-1 rounded-lg text-xs font-bold transition-colors ${
+                    storeSortMode === "cheapest" ? "bg-brand-primary text-white" : "text-slate-400 hover:text-white"
+                  }`}
+                >
+                  ₹ Cheapest
+                </button>
+                <button
+                  onClick={() => setStoreSortMode("fastest")}
+                  className={`px-2.5 py-1 rounded-lg text-xs font-bold transition-colors ${
+                    storeSortMode === "fastest" ? "bg-brand-primary text-white" : "text-slate-400 hover:text-white"
+                  }`}
+                >
+                  ⚡ Fastest
+                </button>
+              </div>
               <div className="flex items-center gap-1.5 bg-surface px-2.5 py-1.5 rounded-xl border border-surface-border">
                 <span className="text-[11px] text-slate-400 font-semibold">Pincode:</span>
                 <input
@@ -698,87 +721,153 @@ export default function ProductDecisionPage({ params }: PageProps) {
             </div>
           )}
 
-          <div className="overflow-x-auto">
-            <table className="w-full text-left text-xs">
-              <thead>
-                <tr className="border-b border-surface-border text-slate-400 uppercase text-[10px] tracking-wider">
-                  <th className="py-3 px-4 font-bold">Store</th>
-                  <th className="py-3 px-4 font-bold">Rank Badge</th>
-                  <th className="py-3 px-4 font-bold">Seller &amp; Terms</th>
-                  <th className="py-3 px-4 font-bold">Peace of Mind</th>
-                  <th className="py-3 px-4 font-bold">Checkout Cash</th>
-                  <th className="py-3 px-4 font-bold">Your Card Net</th>
-                  <th className="py-3 px-4 font-bold text-right">Store Link</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-surface-border/50">
-                {product.ranked_store_choices.map((r, idx) => {
-                  const badgeColor = r.is_overall_winner
-                    ? "bg-emerald-500/20 text-emerald-400 border-emerald-500/30"
-                    : r.rank_badge.includes("Lowest Net Price")
-                    ? "bg-indigo-500/20 text-indigo-400 border-indigo-500/30"
-                    : "bg-amber-500/20 text-amber-400 border-amber-500/30";
-                  const cashPrice = r.checkout_cash_price ?? r.listed_price;
-                  const netPrice = r.best_user_card_net_price ?? r.effective_price;
-                  return (
-                    <tr
-                      key={idx}
-                      className={`hover:bg-surface/50 transition-colors ${
-                        r.is_overall_winner ? "bg-emerald-500/5 font-semibold" : ""
-                      }`}
-                    >
-                      <td className="py-3.5 px-4 font-bold text-white flex items-center gap-2 flex-wrap">
-                        <span>{r.store_name}</span>
-                        {r.is_current_store && (
-                          <span className="text-[10px] px-1.5 py-0.5 rounded bg-indigo-500/20 text-indigo-300 font-extrabold border border-indigo-500/35">
-                            CURRENT PAGE
-                          </span>
-                        )}
-                        {r.is_overall_winner && (
-                          <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-400 font-extrabold border border-emerald-500/30">
-                            WINNER
-                          </span>
-                        )}
-                      </td>
-                      <td className="py-3.5 px-4">
-                        {r.rank_badge && (
-                          <span className={`text-[10px] px-2 py-0.5 rounded font-extrabold border ${badgeColor}`}>
-                            {r.rank_badge}
-                          </span>
-                        )}
-                      </td>
-                      <td className="py-3.5 px-4 text-slate-300">
-                        <div>{r.seller_name || "Official / Direct"}</div>
-                        <div className="text-[10px] text-slate-500">{r.return_terms} · {r.warranty_terms}</div>
-                      </td>
-                      <td className="py-3.5 px-4">
-                        <span className="font-bold text-slate-200">{r.peace_of_mind_score}/100</span>
-                      </td>
-                      <td className="py-3.5 px-4 font-bold text-white text-sm font-mono">
-                        {formatINR(cashPrice)}
-                      </td>
-                      <td className="py-3.5 px-4 font-black text-emerald-400 text-sm font-mono">
-                        {formatINR(netPrice)}
-                      </td>
-                      <td className="py-3.5 px-4 text-right">
-                        {r.url && (
-                          <a
-                            href={r.url}
-                            target="_blank"
-                            rel="noreferrer"
-                            className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg text-xs font-bold bg-surface border border-surface-border text-slate-200 hover:text-white hover:border-slate-500 transition-colors"
+          {[
+            {
+              key: "exact_match",
+              title: "Exact Matches",
+              subtitle: "Confirmed variant, valid live price, in stock",
+              color: "text-emerald-400",
+              items: product.ranked_store_choices.filter(
+                (s) => (s.store_bucket || "exact_match") === "exact_match" && s.in_stock !== false
+              ),
+            },
+            {
+              key: "lesser_known_store",
+              title: "Lesser-Known & Specialty Stores",
+              subtitle: "Specialty/regional D2C merchants & out-of-stock exact listings",
+              color: "text-indigo-400",
+              items: product.ranked_store_choices.filter(
+                (s) =>
+                  s.store_bucket === "lesser_known_store" ||
+                  ((s.store_bucket || "exact_match") === "exact_match" && s.in_stock === false)
+              ),
+            },
+            {
+              key: "variant_mismatch",
+              title: "May Not Be the Exact Item",
+              subtitle: "Same core product, but one or more distinguishing attributes differ",
+              color: "text-amber-400",
+              items: product.ranked_store_choices.filter((s) => s.store_bucket === "variant_mismatch"),
+            },
+          ].map((group) => {
+            if (group.items.length === 0 && group.key !== "exact_match") return null;
+            const sortedItems = [...group.items].sort((a, b) => {
+              if (storeSortMode === "fastest") {
+                const scoreEta = (st: typeof a) => {
+                  if (st.in_stock === false) return 999999;
+                  const e = (st.eta_label || "").toLowerCase();
+                  if (e.includes("min")) return 10;
+                  if (e.includes("1-2")) return 120;
+                  return 360;
+                };
+                const d = scoreEta(a) - scoreEta(b);
+                if (d !== 0) return d;
+              }
+              return (a.best_user_card_net_price ?? a.effective_price) - (b.best_user_card_net_price ?? b.effective_price);
+            });
+            return (
+              <div key={group.key} className="space-y-2 pt-2">
+                <div className="flex items-center justify-between">
+                  <span className={`text-xs font-extrabold uppercase tracking-wider ${group.color}`}>
+                    {group.title} ({sortedItems.length})
+                  </span>
+                  <span className="text-[11px] text-slate-500">{group.subtitle}</span>
+                </div>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left text-xs">
+                    <thead>
+                      <tr className="border-b border-surface-border text-slate-400 uppercase text-[10px] tracking-wider">
+                        <th className="py-3 px-4 font-bold">Store</th>
+                        <th className="py-3 px-4 font-bold">Status &amp; Badges</th>
+                        <th className="py-3 px-4 font-bold">Seller &amp; ETA</th>
+                        <th className="py-3 px-4 font-bold">Peace of Mind</th>
+                        <th className="py-3 px-4 font-bold">Checkout Cash</th>
+                        <th className="py-3 px-4 font-bold">Your Card Net</th>
+                        <th className="py-3 px-4 font-bold text-right">Store Link</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-surface-border/50">
+                      {sortedItems.map((r, idx) => {
+                        const cashPrice = r.checkout_cash_price ?? r.listed_price;
+                        const netPrice = r.best_user_card_net_price ?? r.effective_price;
+                        const outOfStock = r.in_stock === false;
+                        return (
+                          <tr
+                            key={idx}
+                            className={`hover:bg-surface/50 transition-colors ${
+                              r.is_overall_winner && !outOfStock ? "bg-emerald-500/5 font-semibold" : ""
+                            }`}
                           >
-                            <span>Open</span>
-                            <ExternalLink className="w-3 h-3" />
-                          </a>
-                        )}
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
+                            <td className="py-3.5 px-4 font-bold text-white flex items-center gap-2 flex-wrap">
+                              <span>{r.store_name}</span>
+                              {r.is_current_store && (
+                                <span className="text-[10px] px-1.5 py-0.5 rounded bg-indigo-500/20 text-indigo-300 font-extrabold border border-indigo-500/35">
+                                  CURRENT PAGE
+                                </span>
+                              )}
+                              {r.is_overall_winner && !outOfStock && group.key !== "variant_mismatch" && (
+                                <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-400 font-extrabold border border-emerald-500/30">
+                                  🏆 Lowest after offers
+                                </span>
+                              )}
+                            </td>
+                            <td className="py-3.5 px-4 space-x-1">
+                              {outOfStock && (
+                                <span className="text-[10px] px-2 py-0.5 rounded font-extrabold border bg-rose-500/20 text-rose-400 border-rose-500/30">
+                                  Out of stock
+                                </span>
+                              )}
+                              {(r.variant_diff_badges || []).map((vb, bIdx) => (
+                                <span
+                                  key={bIdx}
+                                  className="text-[10px] px-2 py-0.5 rounded font-extrabold border bg-amber-500/20 text-amber-300 border-amber-500/30"
+                                >
+                                  ⚠️ {vb}
+                                </span>
+                              ))}
+                              {!outOfStock && (!r.variant_diff_badges || r.variant_diff_badges.length === 0) && r.rank_badge && (
+                                <span className="text-[10px] px-2 py-0.5 rounded font-extrabold border bg-emerald-500/15 text-emerald-300 border-emerald-500/30">
+                                  {r.rank_badge}
+                                </span>
+                              )}
+                            </td>
+                            <td className="py-3.5 px-4 text-slate-300">
+                              <div>{r.seller_name || "Official / Direct"}</div>
+                              <div className="text-[10px] text-slate-500">
+                                {r.eta_label || "2-4 days"} · {r.return_terms}
+                              </div>
+                            </td>
+                            <td className="py-3.5 px-4">
+                              <span className="font-bold text-slate-200">{r.peace_of_mind_score}/100</span>
+                            </td>
+                            <td className="py-3.5 px-4 font-bold text-white text-sm font-mono">
+                              {formatINR(cashPrice)}
+                            </td>
+                            <td className="py-3.5 px-4 font-black text-emerald-400 text-sm font-mono">
+                              {formatINR(netPrice)}
+                            </td>
+                            <td className="py-3.5 px-4 text-right">
+                              {r.url && (
+                                <a
+                                  href={r.url}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg text-xs font-bold bg-surface border border-surface-border text-slate-200 hover:text-white hover:border-slate-500 transition-colors"
+                                >
+                                  <span>Open</span>
+                                  <ExternalLink className="w-3 h-3" />
+                                </a>
+                              )}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            );
+          })}
 
           {/* ── Quick Commerce (10-Min Delivery) Section ── */}
           <div className="pt-4 border-t border-surface-border space-y-3">

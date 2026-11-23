@@ -483,16 +483,45 @@
     else if (/debit\s*card/.test(low) && !/credit\s*card/.test(low)) paymentType = "debit_card";
     else if (/credit\s*card/.test(low)) paymentType = "credit_card";
 
+    var minSpend = null;
+    var minM = line.match(/(?:min(?:imum)?\s*(?:purchase|spend|order|txn|transaction)(?:\s+value|\s+amount|\s+of)?|orders?\s+above|on\s+orders?\s+of)\s*(?:₹|Rs\.?|INR)?\s*([\d,]+)/i);
+    if (minM) minSpend = parsePrice(minM[1]);
+
     var discInr = null;
     // Strip min spend before pulling discount amount
     var noMin = line.replace(/(?:min(?:imum)?\s*(?:purchase|spend|order|txn|transaction)[^₹\d]{0,20}|orders?\s+above\s*)(?:₹|Rs\.?|INR)?\s*[\d,]+/gi, "");
+    var pctM = noMin.match(/(\d+(?:\.\d+)?)\s*%\s*(?:instant\s+)?(?:discount|off|cashback|back)/i);
+    var capM = noMin.match(/(?:up\s*to|upto|max(?:imum)?(?:\s+discount)?)\s*(?:₹|Rs\.?|INR)\s*([\d,]+)/i);
     var amtM = noMin.match(/(?:₹|Rs\.?|INR)\s*([\d,]+)/i);
     if (amtM) discInr = parsePrice(amtM[1]);
 
+    var hasUpto = /\b(?:up\s*to|upto)\b/i.test(low);
+    var hasFlat = /\bflat\b/i.test(low);
+    var isTeaser =
+      /\b(?:(?:up\s*to|upto)\b.*?\b(?:select\s+(?:credit|debit|bank)?\s*cards?|all\s+banks?|\d+\s+offers?|bank\s+offers?|more\s+offers?)|\d+\s+(?:bank\s+)?offers?\s+available)\b/i.test(line) ||
+      (!bankM && hasUpto) ||
+      (hasUpto && !pctM && !hasFlat && !minSpend);
+    var isNonItem = CROSS_SELL_COUPON_BLOCK_RE.test(line) || /\b(?:gst\s+invoice|business\s+purchase)\b/i.test(line);
+    var emiOnly = paymentType === "emi";
+    var discountType = isTeaser ? "teaser" : (pctM ? "percentage" : (/cashback/i.test(low) && !/instant\s+discount/i.test(low) ? "cashback" : (emiOnly ? "emi" : "flat")));
+    var discountVal = pctM ? parseFloat(pctM[1]) : discInr;
+    var maxCap = capM ? parsePrice(capM[1]) : null;
+    var issuerName = bankM ? bankM[1].replace(/\s+/g, " ").trim() : null;
+
     return {
-      bank_or_app: bankM ? bankM[1].replace(/\s+/g, " ").trim() : null,
+      bank_or_app: issuerName,
+      issuer_or_app: issuerName,
       payment_type: paymentType,
+      payment_channel: paymentType,
+      discount_type: discountType,
+      discount_value: discountVal,
       discount_inr: discInr,
+      max_cap: maxCap,
+      min_spend: minSpend,
+      emi_only: emiOnly,
+      is_teaser_summary: isTeaser,
+      is_non_item_promo: isNonItem,
+      raw_source_text: line,
     };
   }
 
@@ -629,8 +658,18 @@
       };
       if (extra) {
         if (extra.bank_or_app) item.bank_or_app = extra.bank_or_app;
+        if (extra.issuer_or_app) item.issuer_or_app = extra.issuer_or_app;
         if (extra.payment_type) item.payment_type = extra.payment_type;
+        if (extra.payment_channel) item.payment_channel = extra.payment_channel;
+        if (extra.discount_type) item.discount_type = extra.discount_type;
+        if (extra.discount_value != null) item.discount_value = extra.discount_value;
         if (extra.discount_inr != null) item.discount_inr = extra.discount_inr;
+        if (extra.max_cap != null) item.max_cap = extra.max_cap;
+        if (extra.min_spend != null) item.min_spend = extra.min_spend;
+        if (extra.emi_only != null) item.emi_only = extra.emi_only;
+        if (extra.is_teaser_summary != null) item.is_teaser_summary = extra.is_teaser_summary;
+        if (extra.is_non_item_promo != null) item.is_non_item_promo = extra.is_non_item_promo;
+        if (extra.raw_source_text) item.raw_source_text = extra.raw_source_text;
         if (extra.coupon_scope) item.coupon_scope = extra.coupon_scope;
       }
       live.push(item);
@@ -1189,6 +1228,21 @@
       data.variant_specs.unit_price_inr = up.unit_price_inr;
       data.variant_specs.unit_price_label = up.unit_price_label;
     }
+
+    var liveOffersArr = data.raw_live_offers || [];
+    var bankLikeOffers = liveOffersArr.filter(function (o) {
+      return o.offer_type === "bank" || o.offer_type === "upi";
+    });
+    var hasVerifiedGranularOffer = bankLikeOffers.some(function (o) {
+      return !o.is_teaser_summary && !o.is_non_item_promo && o.issuer_or_app;
+    });
+    var hasTeaserSummary = bankLikeOffers.some(function (o) {
+      return !!o.is_teaser_summary;
+    });
+    data.requires_offer_verification = Boolean(hasTeaserSummary && !hasVerifiedGranularOffer);
+    data.offer_verification_note = data.requires_offer_verification
+      ? "Only collapsed teaser offer banners were exposed on the page. Guaranteed instant discount is kept at ₹0 until offer drawer/T&C eligibility is verified."
+      : null;
 
     data.retailer = retailer;
     data.url = window.location.href;

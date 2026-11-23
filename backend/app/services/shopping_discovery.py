@@ -26,10 +26,11 @@ import redis.asyncio as aioredis
 
 from app.config import settings
 from app.schemas.extraction import ClientPayload, CompetitorQuote, DiscoverStoresResponse
+from app.services.product_identity import induce_product_identity_sync
 from app.services.product_matcher import (
+    classify_store_candidate,
     extract_clean_brand,
     extract_variant_specs_from_title,
-    score_candidate_match,
 )
 from app.services.rate_guard import extract_domain
 from app.services.universal_scraper import (
@@ -74,37 +75,20 @@ BLOCKED_URL_PATH_FRAGMENTS = (
 
 
 def build_normalized_query(payload: ClientPayload) -> str:
-    """Build clean `Brand + Model + Exact Variant` without duplicating brand or adding 'Generic'."""
-    brand = extract_clean_brand(payload.brand, payload.title, domain=payload.url)
-    title = (payload.title or "").strip()
-    # Remove parenthetical fluff & punctuation
-    cleaned_title = re.sub(r"\([^)]*\)", " ", title)
-    cleaned_title = re.sub(r"[^a-zA-Z0-9.\s+-]", " ", cleaned_title)
-    words = [
-        w for w in cleaned_title.split()
-        if len(w) > 1 and w.lower() not in {"with", "and", "the", "for", "in", "on", "of", "by", "from", "generic"}
-    ]
-
-    parts: list[str] = []
-    if brand:
-        parts.append(brand)
-    for w in words[:7]:
-        if brand and w.lower() == brand.lower() and parts:
-            continue
-        if w.lower() not in {p.lower() for p in parts}:
-            parts.append(w)
-
-    specs = {**extract_variant_specs_from_title(title), **(payload.variant_specs or {})}
-    if specs.get("storage_gb"):
-        tok = f"{specs['storage_gb']}GB" if specs["storage_gb"] < 1024 else f"{specs['storage_gb'] // 1024}TB"
-        if tok.lower() not in " ".join(parts).lower():
-            parts.append(tok)
-    if specs.get("screen_size_inches"):
-        tok = f"{int(specs['screen_size_inches'])} inch"
-        if tok.lower() not in " ".join(parts).lower():
-            parts.append(tok)
-
-    return " ".join(parts).strip()[:110]
+    """
+    Build clean `Brand + Core Model/Line` query via open-vocabulary `CanonicalProductIdentity`
+    without duplicating brand or adding 'Generic'.
+    """
+    identity = induce_product_identity_sync(
+        title=payload.title or "",
+        brand=payload.brand,
+        specs=payload.variant_specs,
+        url=payload.url,
+        listed_price=payload.listed_price,
+    )
+    if identity.core_model_query and len(identity.core_model_query) >= 3:
+        return identity.core_model_query[:110]
+    return (payload.title or "").strip()[:110]
 
 
 def _is_candidate_shopping_url(url: str, current_domain: str) -> bool:
@@ -124,18 +108,13 @@ def _is_candidate_shopping_url(url: str, current_domain: str) -> bool:
     return True
 
 
-def _is_preferred_domain(url: str) -> bool:
-    domain = extract_domain(url)
-    return any(domain == pref or domain.endswith("." + pref) for pref in PREFERRED_SHOPPING_DOMAINS)
-
-
 def _candidate_quality_score(cand: dict[str, Any], brand: str | None = None) -> tuple[int, int]:
     """
-    Fair multi-site candidate scoring (NO famous-site monopoly):
+    Zero-Whitelist Universal Candidate Scoring (NO famous-site bias):
     Rewards:
       - Official brand domain match
       - Google Shopping / Serper merchant feed hits
-      - Transactional product URL footprint (/products/, /product/, /p/, /dp/)
+      - Transactional product URL footprint (/products/, /product/, /p/, /dp/, /buy)
       - INR price / buy CTA signals in snippet
     """
     url = cand.get("url", "")
@@ -156,10 +135,7 @@ def _candidate_quality_score(cand: dict[str, Any], brand: str | None = None) -> 
         score += 12
     if any(k in snippet for k in ("add to cart", "buy now", "add to bag", "in stock", "authorized reseller", "official store")):
         score += 10
-    if _is_preferred_domain(url):
-        score += 8  # Mild tie-breaker only, never crowds out D2C / regional / Shopify stores
 
-    # Secondary sort key: prefer diverse/D2C/Shopify stores slightly on ties
     is_major_marketplace = 1 if dom in ("amazon.in", "flipkart.com") else 0
     return (-score, is_major_marketplace)
 
@@ -342,23 +318,24 @@ def select_diverse_candidates(
 async def discover_stores(
     payload: ClientPayload,
     *,
-    max_stores: int = 15,
+    max_stores: int = 25,
     on_quote_callback=None,
     redis_client: aioredis.Redis | None = None,
 ) -> DiscoverStoresResponse:
     """
     4-Angle Universal Multi-Store Discovery Pipeline (6h Redis cache, bounded concurrency):
-      1. Optional Google Shopping Graph (Serper)
-      2. Parallel 4-query Open-Web Transactional SearXNG Fan-Out
-      3. Strict Non-Store Domain Blocklist
-      4. Deduplicate Current Page & Probe Up To 15 Diverse Unique Root Domains
+      1. Optional Google Shopping Graph (Serper, num=30)
+      2. Parallel 4-query Open-Web Transactional SearXNG Fan-Out using `core_model_query`
+      3. Strict Non-Store Domain Blocklist (zero famous-site whitelist)
+      4. Deduplicate Current Page & Probe Up To 20-25 Diverse Unique Root Domains,
+         dynamically bucketing into `exact_match`, `lesser_known_store`, or `variant_mismatch`.
     Calls `on_quote_callback(quote)` the millisecond each verified store resolves for real-time SSE streaming.
     """
     query = build_normalized_query(payload)
     if len(query) < 3:
         return DiscoverStoresResponse(query=query, quotes=[], errors=["Product query too short"])
 
-    cache_key = f"discover:v3:{hashlib.sha256(f'{query.lower()}|{payload.retailer}'.encode()).hexdigest()}"
+    cache_key = f"discover:v4:{hashlib.sha256(f'{query.lower()}|{payload.retailer}|{payload.title.lower()}'.encode()).hexdigest()}"
     r = redis_client or await _get_redis()
     if r is not None:
         try:
@@ -379,7 +356,7 @@ async def discover_stores(
     current_domain = extract_domain(payload.url)
     clean_brand = extract_clean_brand(payload.brand, payload.title, domain=payload.url)
     searx_hits, serper_hits = await asyncio.gather(
-        _query_searxng(query, max_results=16),
+        _query_searxng(query, max_results=20),
         _query_serper_shopping(query, max_results=30),
     )
 
@@ -401,14 +378,14 @@ async def discover_stores(
         hit_title = cand.get("title") or ""
 
         if hit_title:
-            pre_ok, _, _ = score_candidate_match(
+            pre_decision = classify_store_candidate(
                 payload.title,
                 hit_title,
                 target_brand=payload.brand,
                 target_specs=payload.variant_specs,
-                min_ratio=52.0,
+                candidate_price=payload.listed_price or 1.0,
             )
-            if not pre_ok:
+            if not pre_decision.accepted:
                 rejected_count += 1
                 return None
 
@@ -420,22 +397,31 @@ async def discover_stores(
             redis_client=r,
         )
 
-        if extracted and extracted.listed_price and extracted.listed_price > 0:
-            ok, score, _reason = score_candidate_match(
+        if extracted and (
+            (extracted.listed_price and extracted.listed_price > 0)
+            or not extracted.in_stock
+        ):
+            decision = classify_store_candidate(
                 payload.title,
                 extracted.title,
                 target_brand=payload.brand,
                 target_specs=payload.variant_specs,
-                min_ratio=68.0,
+                candidate_specs=extracted.variant_specs,
+                candidate_price=extracted.listed_price,
+                reference_median_price=payload.listed_price,
+                in_stock=extracted.in_stock,
+                retailer_key=extracted.retailer,
             )
-            if not ok:
+            if not decision.accepted:
                 rejected_count += 1
                 return None
             quote = payload_to_competitor_quote(
                 extracted,
-                match_score=score,
+                match_score=decision.match_score,
                 extraction_tier=tier_info,
                 source=cand.get("source", "searxng"),
+                store_bucket=decision.bucket if decision.bucket != "rejected" else "exact_match",
+                variant_diff_badges=decision.variant_diff_badges,
             )
             if on_quote_callback:
                 try:

@@ -45,15 +45,68 @@ def _strip_code_fences(text: str) -> str:
     return text.strip()
 
 
+_TEASER_CEILING_RE = re.compile(
+    r"\b(?:(?:up\s*to|upto)\b.*?\b(?:select\s+(?:credit|debit|bank)?\s*cards?|all\s+banks?|\d+\s+offers?|bank\s+offers?|more\s+offers?)|"
+    r"\d+\s+(?:bank\s+)?offers?\s+available)\b",
+    re.I,
+)
+
+_NON_ITEM_PROMO_RE = re.compile(
+    r"\b(?:additional\s+benefits|unlock|next\s+purchase|next\s+order|future\s+order|"
+    r"combo|buy\s+together|extra\s+off\s+on\s+select|spotify|youtube|ott|subscription|"
+    r"partner\s+offer|price\s+inclusive|inclusive\s+of\s+(?:cashback|coupon)|already\s+applied|"
+    r"exchange|with\s+this\s+item|frequently\s+bought|add-?on|gst\s+invoice|business\s+purchase)\b",
+    re.I,
+)
+
+_POST_PURCHASE_CASHBACK_RE = re.compile(
+    r"\b(?:cashback|wallet\s+(?:balance|credit)|reward\s+points?|super\s*coins?|neu\s*coins?|pay\s+balance)\b",
+    re.I,
+)
+
+
+def classify_offer_clause(raw_text: str) -> dict[str, bool]:
+    """
+    Universal structural classifier for an on-page offer clause (zero hardcoded product words):
+      - `is_non_item_promo`: future-order, unlockable, cross-sell, partner/GST, or subscription perk
+      - `is_teaser_summary`: open-ended 'up to' on select cards / N offers without explicit bank + formula
+      - `is_cashback`: post-purchase cashback, wallet credit, or reward points (not instant discount)
+      - `emi_only`: EMI-only offer
+      - `is_upto_ceiling`: uses 'up to' / 'upto' ceiling language
+      - `has_explicit_flat`: states explicit 'Flat' guarantee (or direct '₹X off' without 'up to')
+    """
+    t = " ".join((raw_text or "").split()).strip()
+    low = t.lower()
+    is_non_item = bool(_NON_ITEM_PROMO_RE.search(t))
+    has_upto = bool(re.search(r"\b(?:up\s*to|upto)\b", low))
+    has_pct = bool(re.search(r"\d+(?:\.\d+)?\s*%", low))
+    has_flat_word = bool(re.search(r"\bflat\b", low))
+    has_explicit_flat = has_flat_word or (not has_upto and not has_pct and bool(re.search(r"(?:₹|Rs\.?|INR)\s*[\d,]+", t, re.I)))
+    is_cashback = bool(_POST_PURCHASE_CASHBACK_RE.search(low)) and "instant discount" not in low
+    emi_only = ("emi" in low) and ("non-emi" not in low)
+    is_teaser = bool(_TEASER_CEILING_RE.search(t)) or (
+        has_upto and not has_pct and not has_flat_word
+    )
+    return {
+        "is_non_item_promo": is_non_item,
+        "is_teaser_summary": is_teaser,
+        "is_cashback": is_cashback,
+        "emi_only": emi_only,
+        "is_upto_ceiling": has_upto,
+        "has_explicit_flat": has_explicit_flat,
+    }
+
+
 def _deterministic_bank_offers(raw_texts: list[str]) -> list[BankOfferRule]:
     """
     Accurate deterministic parser for live Indian on-page bank offers.
     - Extracts every bank mentioned in a line (e.g. 'HDFC, ICICI & SBI Credit Card').
     - Never confuses min-spend or max-cap with flat discount when percentage discount is present.
-    - Parses card_type (credit/debit/emi/both), flat or %, max_discount_cap, and min_txn_amount.
+    - Parses card_type (credit/debit/emi/both), flat or %, max_discount_cap, min_txn_amount,
+      and 5-gate verification flags (`is_teaser_summary`, `is_non_item_promo`, `is_cashback`, `emi_only`).
     """
     rules: list[BankOfferRule] = []
-    seen_keys: set[tuple[str, float, float, float, float]] = set()
+    seen_keys: set[tuple[str, float, float, float, float, str]] = set()
     bank_pat = re.compile(
         r"\b(hdfc|icici|sbi|axis|kotak|amex|american\s+express|citi|rbl|idfc|bob|bank\s+of\s+baroda|standard\s+chartered|hsbc|federal|onecard|one\s+card|yes\s+bank|indusind|au\s+bank|rupay)\b",
         re.I,
@@ -66,10 +119,12 @@ def _deterministic_bank_offers(raw_texts: list[str]) -> list[BankOfferRule]:
 
     for text in raw_texts:
         t = " ".join((text or "").split()).strip()
-        if not t or len(t) < 12:
+        if not t or len(t) < 10:
             continue
         low = t.lower()
-        # Skip pure no-cost EMI interest-savings lines that are not instant discounts
+        flags = classify_offer_clause(t)
+
+        # Skip pure no-cost EMI interest-savings lines that have no discount amount
         if "no cost emi" in low and "instant discount" not in low and "off" not in low and "cashback" not in low:
             continue
 
@@ -116,15 +171,22 @@ def _deterministic_bank_offers(raw_texts: list[str]) -> list[BankOfferRule]:
                 if cand_flat > 0 and cand_flat != min_txn:
                     flat = cand_flat
 
-        if flat <= 0 and pct <= 0:
+        if flat <= 0 and pct <= 0 and not flags["is_teaser_summary"]:
             continue
 
+        is_teaser = flags["is_teaser_summary"]
         if not found_banks:
             found_banks = ["ALL BANKS"]
+            # Any offer without an explicit bank issuer name is a teaser / unverified summary
+            is_teaser = True
+
+        # If an 'up to' flat offer has no % formula, no explicit 'Flat' word, and no verified min_txn_amount, it is a teaser ceiling
+        if flags["is_upto_ceiling"] and pct == 0.0 and not flags["has_explicit_flat"] and min_txn <= 0:
+            is_teaser = True
 
         if "non-emi" in low:
             card_type = "debit" if ("debit" in low and "credit" not in low) else ("credit" if "credit" in low else "both")
-        elif "emi" in low and "non-emi" not in low:
+        elif flags["emi_only"]:
             card_type = "emi"
         elif "debit" in low and "credit" not in low:
             card_type = "debit"
@@ -134,7 +196,7 @@ def _deterministic_bank_offers(raw_texts: list[str]) -> list[BankOfferRule]:
             card_type = "both"
 
         for bname in found_banks:
-            dedup_key = (bname, flat, pct, cap, min_txn)
+            dedup_key = (bname, flat, pct, cap, min_txn, card_type)
             if dedup_key in seen_keys:
                 continue
             seen_keys.add(dedup_key)
@@ -148,6 +210,12 @@ def _deterministic_bank_offers(raw_texts: list[str]) -> list[BankOfferRule]:
                     discount_pct=pct,
                     max_discount_cap=cap,
                     summary=t[:160],
+                    emi_only=(card_type == "emi" or flags["emi_only"]),
+                    is_teaser_summary=is_teaser,
+                    is_non_item_promo=flags["is_non_item_promo"],
+                    is_cashback=flags["is_cashback"],
+                    is_upto_ceiling=flags["is_upto_ceiling"],
+                    has_explicit_flat=flags["has_explicit_flat"],
                 )
             )
     return rules
@@ -438,29 +506,53 @@ class LLMParser:
         peace_of_mind_score: int,
         key_pros: list[str],
         key_cons: list[str],
+        *,
+        checkout_payable_inr: float | None = None,
+        unowned_option_note: str | None = None,
+        excluded_stores_note: str | None = None,
     ) -> ExecutiveSummary:
-        cache_key_content = f"{product_title}:{best_store}:{best_seller}:{effective_price}:{best_offer_stack}"
+        upfront_cash = checkout_payable_inr if (checkout_payable_inr is not None and checkout_payable_inr > 0) else effective_price
+        cache_key_content = (
+            f"{product_title}:{best_store}:{best_seller}:{upfront_cash}:{effective_price}:"
+            f"{best_offer_stack}:{unowned_option_note or ''}:{excluded_stores_note or ''}"
+        )
         key = self._hash(cache_key_content, "exec_summary")
         cached = await self._get_cached(key, ExecutiveSummary)
         if cached:
             return cached
 
-        # Deterministic fallback template
+        # Brutally Honest Deterministic Recommendation
         bullets = [
-            f"Best Store & Seller: Buy from {best_store} (Seller: {best_seller}) for verified genuine dispatch.",
-            f"Maximum Savings Stack: Apply {best_offer_stack} to achieve final net price of ₹{effective_price:,.0f}.",
-            f"Decision Verdict ({peace_of_mind_score}/100 Trust): Balances competitive pricing with manufacturer warranty coverage.",
+            f"Cheapest Guaranteed Upfront Checkout: Pay ₹{upfront_cash:,.0f} today on {best_store} (Seller: {best_seller}) using {best_offer_stack}.",
         ]
-        if key_cons:
-            bullets.append(f"Caveat to watch: {key_cons[0]}")
+        if effective_price < upfront_cash:
+            bullets.append(
+                f"Post-Purchase Net Cost: Works out to ₹{effective_price:,.0f} only after ₹{upfront_cash - effective_price:,.0f} in verified post-purchase rewards."
+            )
+        if unowned_option_note:
+            bullets.append(unowned_option_note)
+        if excluded_stores_note:
+            bullets.append(excluded_stores_note)
+        bullets.append(
+            f"Seller Trust ({peace_of_mind_score}/100): Verified dispatch with manufacturer warranty coverage."
+        )
+
+        caveat_text = (
+            excluded_stores_note
+            or (key_cons[0] if key_cons else "Verify serial number and package seal on delivery.")
+        )
 
         fallback = ExecutiveSummary(
             best_store=best_store,
             best_seller=best_seller,
             best_offer_stack=best_offer_stack,
             final_net_price=effective_price,
-            why_this_wins=f"Lowest effective net checkout (₹{effective_price:,.0f}) paired with {peace_of_mind_score}/100 seller peace-of-mind score.",
-            key_caveat=key_cons[0] if key_cons else "Verify serial number on brand warranty portal upon delivery.",
+            why_this_wins=(
+                f"Cheapest guaranteed upfront checkout of ₹{upfront_cash:,.0f} today"
+                + (f" (₹{effective_price:,.0f} net after verified rewards)" if effective_price < upfront_cash else "")
+                + f" on {best_store} with {peace_of_mind_score}/100 seller trust."
+            ),
+            key_caveat=caveat_text,
             summary_bullets=bullets,
         )
 
@@ -468,14 +560,18 @@ class LLMParser:
             return fallback
 
         prompt = (
-            "You are India's leading e-commerce consumer trust & price intelligence advisor.\n"
-            "Synthesize an authoritative 3-bullet Executive Recommendation for an Indian shopper.\n"
+            "You are India's brutally honest e-commerce consumer trust & price intelligence advisor.\n"
+            "Synthesize an authoritative 3-4 bullet Executive Recommendation:\n"
+            "1. Lead with the exact cheapest guaranteed upfront checkout action (Cash Paid Today).\n"
+            "2. Explicitly separate any post-purchase rewards or unowned-card option.\n"
+            "3. Explicitly state if any cheaper/equal store was excluded due to unconfirmed variant or out-of-stock status.\n"
             f"Product: {product_title}\n"
-            f"Top Store & Seller: {best_store} / {best_seller} (Peace of Mind: {peace_of_mind_score}/100)\n"
-            f"Net Checkout Price: ₹{effective_price:,.0f}\n"
+            f"Winning Store & Seller: {best_store} / {best_seller} (Trust: {peace_of_mind_score}/100)\n"
+            f"Upfront Cash Paid Today: ₹{upfront_cash:,.0f}\n"
+            f"Effective Net After Verified Rewards: ₹{effective_price:,.0f}\n"
             f"Best Offer Stack: {best_offer_stack}\n"
-            f"Key Pros: {', '.join(key_pros[:3])}\n"
-            f"Key Cons/Caveats: {', '.join(key_cons[:2]) if key_cons else 'None'}\n\n"
+            f"Unowned Card Note: {unowned_option_note or 'None'}\n"
+            f"Excluded Stores Note: {excluded_stores_note or 'None'}\n\n"
             "Return JSON matching this schema:\n"
             "{\"best_store\":str,\"best_seller\":str,\"best_offer_stack\":str,\"final_net_price\":float,"
             "\"why_this_wins\":str,\"key_caveat\":str,\"summary_bullets\":[str]}"

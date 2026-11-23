@@ -135,6 +135,7 @@ export interface StoreRankingChoice {
   checkout_cash_price?: number;
   best_user_card_net_price?: number;
   effective_price: number;
+  in_stock?: boolean;
   is_current_store?: boolean;
   seller_name: string;
   peace_of_mind_score: number;
@@ -143,6 +144,9 @@ export interface StoreRankingChoice {
   overall_score: number;
   rank_badge: string;
   is_overall_winner: boolean;
+  store_bucket?: "exact_match" | "lesser_known_store" | "variant_mismatch";
+  variant_diff_badges?: string[];
+  eta_label?: string;
 }
 
 export interface QuickCommerceQuote {
@@ -176,7 +180,7 @@ export interface ExecutiveSummary {
   summary_bullets: string[];
 }
 
-export type VerificationStatus = "page_verified" | "live_tc_verified" | "no_verified_offer";
+export type VerificationStatus = "page_verified" | "live_tc_verified" | "issuer_tc_verified" | "no_verified_offer";
 
 export interface PostPurchaseRewards {
   reward_type: string;
@@ -219,6 +223,10 @@ export interface CashVsPointsReport {
   winning_owned_card_name?: string | null;
   winning_instant_offer_summary?: string | null;
   user_wallet_empty?: boolean;
+  requires_offer_verification?: boolean;
+  offer_verification_note?: string;
+  emi_offers?: Array<Record<string, any>>;
+  gate_audit_log?: Array<Record<string, any>>;
   routes: PaymentRouteAnalysis[];
   unowned_card_routes?: PaymentRouteAnalysis[];
   best_route_cash: string | null;

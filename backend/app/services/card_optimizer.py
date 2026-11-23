@@ -75,24 +75,15 @@ def _best_bank_discount(
     offers: list[BankOfferRule],
     guaranteed_price: float,
 ) -> tuple[float, str]:
-    """Return (best_discount, offer_summary) for this card."""
+    """Return (best_discount, offer_summary) for this card after 5-gate verification."""
+    from app.services.offer_stack_engine import evaluate_offer_5_gates
+
     best = 0.0
     summary = ""
     for offer in offers:
-        if not _card_matches_offer(card, offer):
+        passed, disc, _, _ = evaluate_offer_5_gates(offer, card, guaranteed_price)
+        if not passed:
             continue
-        if guaranteed_price < offer.min_txn_amount:
-            continue
-        excluded = [e.lower() for e in (offer.excluded_cards or [])]
-        if card.card_name.lower() in excluded:
-            continue
-        disc = 0.0
-        if offer.discount_flat > 0:
-            disc = offer.discount_flat
-        elif offer.discount_pct > 0:
-            disc = guaranteed_price * offer.discount_pct / 100.0
-            if offer.max_discount_cap > 0:
-                disc = min(disc, offer.max_discount_cap)
         if disc > best:
             best = disc
             summary = offer.summary or f"{offer.bank_name} {offer.discount_flat or offer.discount_pct}% off"

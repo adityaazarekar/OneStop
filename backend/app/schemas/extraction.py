@@ -35,6 +35,16 @@ class LiveOfferRaw(BaseModel):
     payment_type: str | None = None  # credit_card, debit_card, upi, emi, coupon, fee
     discount_inr: float | None = None
     coupon_scope: str | None = None  # current_item_coupon | cross_sell | future_order | None
+    issuer_or_app: str | None = None
+    payment_channel: str | None = None
+    discount_type: str | None = None  # flat | percentage | teaser | cashback | emi | fee
+    discount_value: float | None = None
+    max_cap: float | None = None
+    min_spend: float | None = None
+    emi_only: bool = False
+    is_teaser_summary: bool = False
+    is_non_item_promo: bool = False
+    raw_source_text: str | None = None
 
 
 class ClientPayload(BaseModel):
@@ -50,7 +60,11 @@ class ClientPayload(BaseModel):
     retailer_advertised_lowest_price: float | None = None
     image_url: str | None = None
     pincode: str | None = None
+    currency: str = "INR"
     in_stock: bool = True
+    is_transactional_store: bool = True
+    requires_offer_verification: bool = False
+    offer_verification_note: str | None = None
     seller_name: str | None = None
     seller_rating: float | None = None
     sellers: list[DynamicSellerInfo] = Field(default_factory=list)
@@ -100,14 +114,16 @@ class ClientPayload(BaseModel):
 # Cross-store competitor quotes (from extension)
 # ───────────────────────────────────────────
 class CompetitorQuote(BaseModel):
-    """Live price scraped from a competing retailer by the extension's background.js."""
+    """Live price scraped from a competing retailer by the extension's background.js or universal scraper."""
 
     retailer: str
     title: str
     listed_price: float | None = None
+    currency: str = "INR"
     url: str
     sku: str = ""
     in_stock: bool = True
+    is_transactional_store: bool = True
     seller_name: str | None = None
     seller_rating: float | None = None
     return_policy: str | None = None
@@ -118,6 +134,9 @@ class CompetitorQuote(BaseModel):
     extraction_tier: str | None = None
     image_url: str | None = None
     source: str | None = None  # "extension_offscreen" | "searxng" | "serper"
+    store_bucket: Literal["exact_match", "lesser_known_store", "variant_mismatch"] = "exact_match"
+    variant_diff_badges: list[str] = Field(default_factory=list)
+    eta_label: str | None = None
 
 
 class QuickCommerceQuote(BaseModel):
@@ -183,6 +202,12 @@ class BankOfferRule(BaseModel):
     excluded_cards: list[str] = Field(default_factory=list)
     valid_until: str | None = None
     summary: str = ""
+    emi_only: bool = False
+    is_teaser_summary: bool = False
+    is_non_item_promo: bool = False
+    is_cashback: bool = False
+    is_upto_ceiling: bool = False
+    has_explicit_flat: bool = False
 
 
 class BankOfferRuleList(BaseModel):
@@ -376,6 +401,7 @@ class StoreRankingChoice(BaseModel):
     checkout_cash_price: float = 0.0
     best_user_card_net_price: float = 0.0
     effective_price: float
+    in_stock: bool = True
     is_current_store: bool = False
     seller_name: str = ""
     peace_of_mind_score: int = 50
@@ -384,6 +410,9 @@ class StoreRankingChoice(BaseModel):
     overall_score: float = 0.0
     rank_badge: str = ""  # "Lowest Net Price", "Official & Peace of Mind", "Overall Best Choice"
     is_overall_winner: bool = False
+    store_bucket: Literal["exact_match", "lesser_known_store", "variant_mismatch"] = "exact_match"
+    variant_diff_badges: list[str] = Field(default_factory=list)
+    eta_label: str = "2-4 days"
 
 
 # ───────────────────────────────────────────
@@ -474,6 +503,10 @@ class CashVsPointsReport(BaseModel):
     winning_owned_card_name: str | None = None
     winning_instant_offer_summary: str | None = None
     user_wallet_empty: bool = False
+    requires_offer_verification: bool = False
+    offer_verification_note: str = ""
+    emi_offers: list[dict] = Field(default_factory=list)
+    gate_audit_log: list[dict] = Field(default_factory=list)
     routes: list[PaymentRouteAnalysis] = Field(default_factory=list)
     unowned_card_routes: list[PaymentRouteAnalysis] = Field(default_factory=list)
     best_route_cash: str | None = None
@@ -487,7 +520,7 @@ class CashVsPointsReport(BaseModel):
 # ───────────────────────────────────────────
 class DiscoverStoresRequest(BaseModel):
     payload: ClientPayload
-    max_stores: int = Field(default=15, ge=1, le=20)
+    max_stores: int = Field(default=25, ge=1, le=30)
     pincode: str | None = None
 
 

@@ -392,6 +392,89 @@ def compare_image_phashes(phash_a: str | None, phash_b: str | None, max_hamming_
         return True, None
 
 
+def classify_store_candidate(
+    target_title: str,
+    candidate_title: str,
+    *,
+    target_brand: str | None = None,
+    target_specs: dict | None = None,
+    candidate_specs: dict | None = None,
+    candidate_price: float | None = None,
+    reference_median_price: float | None = None,
+    in_stock: bool = True,
+    retailer_key: str | None = None,
+    target_image_phash: str | None = None,
+    candidate_image_phash: str | None = None,
+):
+    """
+    Generative-Lexical Cascade for 3-Tier Dynamic Store Bucketing:
+      - Induces open-vocabulary `CanonicalProductIdentity` for target and candidate
+      - Rejects different `product_type` (accessories, spare parts, refills) or different `brand`/`core_model`
+      - Buckets accepted candidates into `exact_match`, `lesser_known_store`, or `variant_mismatch`
+        with auto-generated `variant_diff_badges: list[str]`.
+    """
+    from app.services.product_identity import (
+        StoreBucketDecision,
+        compare_product_identities,
+        induce_product_identity_sync,
+    )
+
+    if not target_title or not candidate_title:
+        return StoreBucketDecision(
+            accepted=False,
+            bucket="rejected",
+            match_score=0.0,
+            reject_reason="Empty title",
+        )
+
+    t_specs_combined = {**extract_variant_specs_from_title(target_title), **(target_specs or {})}
+    c_specs_combined = {**extract_variant_specs_from_title(candidate_title), **(candidate_specs or {})}
+
+    # Fast accessory guard from explicit specs or lexical head check
+    if bool(c_specs_combined.get("is_accessory")) != bool(t_specs_combined.get("is_accessory")):
+        return StoreBucketDecision(
+            accepted=False,
+            bucket="rejected",
+            match_score=0.0,
+            reject_reason="Product type mismatch (accessory vs primary item)",
+        )
+
+    phash_ok, phash_dist = compare_image_phashes(target_image_phash, candidate_image_phash)
+    if not phash_ok:
+        return StoreBucketDecision(
+            accepted=False,
+            bucket="rejected",
+            match_score=0.0,
+            reject_reason=f"Perceptual image hash mismatch (hamming distance {phash_dist})",
+        )
+
+    target_id = induce_product_identity_sync(
+        title=target_title,
+        brand=target_brand,
+        specs=t_specs_combined,
+    )
+    cand_id = induce_product_identity_sync(
+        title=candidate_title,
+        brand=None,
+        specs=c_specs_combined,
+        listed_price=candidate_price,
+    )
+
+    decision = compare_product_identities(
+        target_id,
+        cand_id,
+        target_title=target_title,
+        candidate_title=candidate_title,
+        candidate_price=candidate_price if candidate_price is not None else 1.0,
+        reference_median_price=reference_median_price,
+        in_stock=in_stock,
+        retailer_key=retailer_key,
+    )
+    if decision.accepted and phash_dist is not None and phash_dist <= 6:
+        decision.match_score = min(100.0, round(decision.match_score + 5.0, 1))
+    return decision
+
+
 def score_candidate_match(
     target_title: str,
     candidate_title: str,
@@ -402,12 +485,12 @@ def score_candidate_match(
     candidate_image_phash: str | None = None,
 ) -> tuple[bool, float, str]:
     """
-    Multimodal SKU & Variant Verification:
-      1. Hard Spec Blockers (Accessory guard, Brand, RAM, Storage, Screen Size, Pack Weight/Volume, Tier)
+    Multimodal Exact SKU & Variant Verification:
+      1. Hard Spec & Product-Type Blockers (Accessory guard, Brand, Dynamic Attributes)
       2. Model Number Parity
       3. Perceptual Image Hashing (`imagehash.phash` via Pillow, gracefully skipped when unavailable)
       4. `RapidFuzz` (`token_set_ratio`)
-    Returns (is_match, score_0_to_100, reject_reason).
+    Returns (is_exact_match, score_0_to_100, reject_reason).
     """
     if not target_title or not candidate_title:
         return False, 0.0, "Empty title"
@@ -416,9 +499,25 @@ def score_candidate_match(
     t_specs = {**extract_variant_specs_from_title(target_title), **(target_specs or {})}
     c_specs = extract_variant_specs_from_title(candidate_title)
 
-    # 1. Accessory rejection
+    # 1. Accessory & Open-Vocabulary Product-Type rejection
     if c_specs.get("is_accessory") and not t_specs.get("is_accessory"):
         return False, 0.0, "Candidate is an accessory"
+
+    decision = classify_store_candidate(
+        target_title,
+        candidate_title,
+        target_brand=target_brand,
+        target_specs=t_specs,
+        candidate_specs=c_specs,
+        candidate_price=1.0,
+        in_stock=True,
+        target_image_phash=target_image_phash,
+        candidate_image_phash=candidate_image_phash,
+    )
+    if not decision.accepted:
+        return False, 0.0, decision.reject_reason
+    if decision.bucket == "variant_mismatch":
+        return False, 0.0, f"Variant spec mismatch ({', '.join(decision.variant_diff_badges)})"
 
     # 2. Brand consistency check when target has a real brand
     clean_target_brand = extract_clean_brand(target_brand, target_title)

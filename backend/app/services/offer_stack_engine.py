@@ -127,6 +127,10 @@ def _parse_live_cashback_or_upi(offer_text: str, current_price: float) -> tuple[
         return 0.0, ""
 
     lower = offer_text.lower()
+    # Reject open-ended 'up to' / 'upto' teaser ceilings unless an explicit 'flat' or '%' formula is given
+    if re.search(r"\b(?:up\s*to|upto)\b", lower) and "flat" not in lower and "%" not in lower:
+        return 0.0, ""
+
     if any(
         k in lower
         for k in (
@@ -216,47 +220,161 @@ def _card_name_matches_text(card_name: str, text: str) -> bool:
     return len(tokens) >= 2 and all(tok in t_low for tok in tokens)
 
 
+def evaluate_offer_5_gates(
+    offer: BankOfferRule,
+    card: CardLike | None,
+    base_price: float,
+    *,
+    retailer_advertised_lowest_price: float | None = None,
+) -> tuple[bool, float, str, str]:
+    """
+    Strict 5-Gate Deterministic Math Guard (`offer_stack_engine.py`):
+    No offer may reduce `checkout_payable_inr` unless it passes ALL 5 deterministic gates:
+      Gate 1 — Guaranteed Instant Discount Only (rejects teasers, non-item promos, post-purchase cashback/points)
+      Gate 2 — Exact User-Wallet Match (issuer, payment channel credit vs debit, and card exclusions)
+      Gate 3 — Payment Mode Match (rejects `emi_only` from full-swipe checkout cash)
+      Gate 4 — Minimum Order Value (`min_spend`) Verification & conditional 'up to' guard
+      Gate 5 — Exact Formula (`min(round(listed_price * Y / 100), Z)`) & advertised lowest-price sanity guard
+    Returns `(passed, guaranteed_discount_inr, gate_code, detail_reason)`.
+    """
+    from app.services.llm_parser import classify_offer_clause
+
+    summary_text = offer.summary or ""
+    flags = classify_offer_clause(summary_text) if summary_text else {}
+
+    is_non_item = bool(getattr(offer, "is_non_item_promo", False) or flags.get("is_non_item_promo", False))
+    is_teaser = bool(getattr(offer, "is_teaser_summary", False) or flags.get("is_teaser_summary", False))
+    is_cashback = bool(getattr(offer, "is_cashback", False) or flags.get("is_cashback", False))
+    is_emi = bool(getattr(offer, "emi_only", False) or offer.card_type == "emi" or flags.get("emi_only", False))
+    is_upto = bool(getattr(offer, "is_upto_ceiling", False) or flags.get("is_upto_ceiling", False))
+    has_flat = bool(getattr(offer, "has_explicit_flat", False) or flags.get("has_explicit_flat", False))
+
+    # ── Gate 1: Guaranteed Instant Discount Only ──
+    if is_non_item or (summary_text and is_cross_sell_or_invalid_coupon(summary_text)):
+        return False, 0.0, "gate1_non_item_promo", "Rejected non-item / cross-sell / future-order promo"
+    if is_teaser:
+        return False, 0.0, "gate1_teaser_summary", "Rejected open-ended teaser summary (requires offer verification)"
+    if is_cashback:
+        return False, 0.0, "gate1_post_purchase_cashback", "Excluded post-purchase cashback/points from upfront checkout cash"
+
+    # ── Gate 3: Payment Mode Match (checked early so EMI offers are cleanly classified) ──
+    if is_emi:
+        return (
+            False,
+            0.0,
+            "gate3_emi_only",
+            "EMI-only offer excluded from full-swipe checkout cash (processing fee + 18% GST apply on EMI)",
+        )
+
+    # ── Gate 2: Exact User-Wallet Match ──
+    if card is None:
+        return False, 0.0, "gate2_no_user_card", "No matching card in user wallet"
+    bname = (offer.bank_name or "").strip()
+    if not bname or bname.upper() in ("ALL BANKS", "ALL", "SELECT CARDS", "SELECT BANK"):
+        return False, 0.0, "gate2_no_explicit_issuer", "Offer lacks explicit bank issuer name"
+
+    card_bank_norm = _normalize_bank_token(card.bank_name)
+    offer_bank_norm = _normalize_bank_token(bname)
+    c_low = card.card_name.lower().strip()
+
+    if (
+        offer_bank_norm != card_bank_norm
+        and bname.lower() not in card.bank_name.lower()
+        and card.bank_name.lower() not in bname.lower()
+    ):
+        return False, 0.0, "gate2_issuer_mismatch", f"Issuer '{bname}' does not match wallet card '{card.bank_name}'"
+
+    # Channel check: Debit vs Credit
+    is_user_debit = "debit" in c_low
+    if offer.card_type == "debit" and not is_user_debit:
+        return False, 0.0, "gate2_channel_mismatch", f"Offer requires {bname} Debit Card; '{card.card_name}' is a Credit Card"
+    if offer.card_type == "credit" and is_user_debit:
+        return False, 0.0, "gate2_channel_mismatch", f"Offer requires {bname} Credit Card; '{card.card_name}' is a Debit Card"
+
+    excluded = [e.lower() for e in (offer.excluded_cards or [])]
+    if c_low in excluded or any(_card_name_matches_text(card.card_name, ex) for ex in excluded):
+        return False, 0.0, "gate2_card_excluded", f"Card '{card.card_name}' is explicitly excluded in offer T&Cs"
+    if c_low in ("sbi cashback", "icici amazon pay") and not _card_name_matches_text(card.card_name, summary_text):
+        return False, 0.0, "gate2_cobrand_excluded", f"Co-branded '{card.card_name}' is excluded from general instant discounts"
+
+    # ── Gate 4: Minimum Order Value (`min_spend`) Verification ──
+    min_spend = float(offer.min_txn_amount or 0.0)
+    if base_price < min_spend:
+        return (
+            False,
+            0.0,
+            "gate4_min_spend_not_met",
+            f"Listed price ₹{base_price:,.0f} is below required min_spend ₹{min_spend:,.0f}",
+        )
+    if is_upto and offer.discount_pct <= 0 and not has_flat and min_spend <= 0:
+        return (
+            False,
+            0.0,
+            "gate4_conditional_unverified",
+            "Up-to offer lacks both a Flat guarantee and a verified min_spend",
+        )
+
+    # ── Gate 5: Exact Formula & Sanity Guard ──
+    disc = 0.0
+    if offer.discount_pct > 0:
+        raw_pct_disc = round(base_price * offer.discount_pct / 100.0, 2)
+        disc = min(raw_pct_disc, offer.max_discount_cap) if offer.max_discount_cap > 0 else raw_pct_disc
+    elif offer.discount_flat > 0:
+        disc = round(float(offer.discount_flat), 2)
+    else:
+        return False, 0.0, "gate5_no_formula", "Offer lacks a valid flat or percentage discount formula"
+
+    if disc <= 0 or disc >= base_price:
+        return False, 0.0, "gate5_invalid_discount_bounds", f"Computed discount ₹{disc:,.0f} is out of valid bounds"
+
+    if (
+        retailer_advertised_lowest_price
+        and retailer_advertised_lowest_price > 0
+        and (base_price - disc) < (retailer_advertised_lowest_price - 500.0)
+        and not has_flat
+        and offer.discount_pct <= 0
+    ):
+        return (
+            False,
+            0.0,
+            "gate5_advertised_lowest_sanity_failed",
+            f"Discount drops price below retailer advertised lowest price ₹{retailer_advertised_lowest_price:,.0f}",
+        )
+
+    return True, round(disc, 2), "passed", "Verified 5-Gate instant discount"
+
+
 def _best_verified_instant_discount(
     card: CardLike,
     bank_offers: list[BankOfferRule],
     base_price: float,
+    *,
+    retailer_advertised_lowest_price: float | None = None,
+    audit_log: list[dict] | None = None,
 ) -> tuple[float, BankOfferRule | None]:
     best_disc = 0.0
     best_rule: BankOfferRule | None = None
-    card_bank_norm = _normalize_bank_token(card.bank_name)
-    c_low = card.card_name.lower().strip()
 
     for offer in bank_offers:
-        if not offer.bank_name:
-            continue
-        offer_bank_norm = _normalize_bank_token(offer.bank_name)
-        is_all_banks = offer.bank_name.strip().upper() in ("ALL BANKS", "ALL")
-        if not is_all_banks:
-            if (
-                offer_bank_norm != card_bank_norm
-                and offer.bank_name.lower() not in card.bank_name.lower()
-                and card.bank_name.lower() not in offer.bank_name.lower()
-            ):
-                continue
-        if base_price < (offer.min_txn_amount or 0.0):
-            continue
-        excluded = [e.lower() for e in (offer.excluded_cards or [])]
-        if c_low in excluded or any(_card_name_matches_text(card.card_name, ex) for ex in excluded):
-            continue
-        # Co-branded cashback cards (SBI Cashback, ICICI Amazon Pay) are typically excluded from
-        # general bank instant discounts UNLESS explicitly named in the offer text.
-        if c_low in ("sbi cashback", "icici amazon pay") and not _card_name_matches_text(card.card_name, offer.summary or ""):
-            continue
-
-        disc = 0.0
-        if offer.discount_flat > 0:
-            disc = offer.discount_flat
-        elif offer.discount_pct > 0:
-            disc = base_price * offer.discount_pct / 100.0
-            if offer.max_discount_cap > 0:
-                disc = min(disc, offer.max_discount_cap)
-
-        if disc > best_disc:
+        passed, disc, gate_code, reason = evaluate_offer_5_gates(
+            offer,
+            card,
+            base_price,
+            retailer_advertised_lowest_price=retailer_advertised_lowest_price,
+        )
+        if audit_log is not None:
+            audit_log.append(
+                {
+                    "card": card.card_name,
+                    "bank": offer.bank_name,
+                    "summary": offer.summary,
+                    "passed": passed,
+                    "discount_inr": disc,
+                    "gate": gate_code,
+                    "reason": reason,
+                }
+            )
+        if passed and disc > best_disc:
             best_disc = disc
             best_rule = offer
 
@@ -401,11 +519,47 @@ def compute_cash_vs_points_report(
         if r.last_verified_at and (latest_verified is None or r.last_verified_at > latest_verified):
             latest_verified = r.last_verified_at
 
+    gate_audit_log: list[dict] = []
+    emi_offers: list[dict] = []
+    saw_teaser_or_conditional = False
+
+    for bo in bank_offers or []:
+        from app.services.llm_parser import classify_offer_clause
+
+        flags = classify_offer_clause(bo.summary or "")
+        if getattr(bo, "emi_only", False) or bo.card_type == "emi" or flags.get("emi_only"):
+            emi_disc = (
+                min(round(price_after_coupon * bo.discount_pct / 100.0, 2), bo.max_discount_cap)
+                if (bo.discount_pct > 0 and bo.max_discount_cap > 0)
+                else (round(price_after_coupon * bo.discount_pct / 100.0, 2) if bo.discount_pct > 0 else bo.discount_flat)
+            )
+            emi_offers.append(
+                {
+                    "bank_name": bo.bank_name,
+                    "discount_inr": round(emi_disc, 2),
+                    "min_spend": bo.min_txn_amount,
+                    "summary": bo.summary,
+                    "fee_note": "EMI processing fee (typically ₹199–₹299) + 18% GST on interest/fees apply; excluded from full-swipe checkout cash.",
+                }
+            )
+        if getattr(bo, "is_teaser_summary", False) or flags.get("is_teaser_summary"):
+            saw_teaser_or_conditional = True
+
+    for lo in raw_live_offers or []:
+        if getattr(lo, "is_teaser_summary", False):
+            saw_teaser_or_conditional = True
+
     def _evaluate_card_route(card: CardLike, is_owned: bool) -> tuple[PaymentRouteAnalysis, float, BankOfferRule | None]:
         rule = rule_by_name.get(card.card_name.lower()) or build_no_verified_offer_rule(
             card.card_name, "credit_card", reason="No active verified offer found"
         )
-        instant_disc, matched_offer = _best_verified_instant_discount(card, bank_offers, price_after_coupon)
+        instant_disc, matched_offer = _best_verified_instant_discount(
+            card,
+            bank_offers,
+            price_after_coupon,
+            retailer_advertised_lowest_price=retailer_advertised_lowest_price,
+            audit_log=gate_audit_log if is_owned else None,
+        )
         payable_today = max(0.0, round(listed_price - coupon_disc - instant_disc + mandatory_fees, 2))
 
         # Mutual-exclusion guard: if an instant bank discount is applied AND the card's verified T&C exclusions
@@ -759,6 +913,22 @@ def compute_cash_vs_points_report(
             f"Voucher fee note: {fee_routes[0].method_name} adds ₹{fee_routes[0].rewards.processing_fee_inr:,.0f} processing fee."
         )
 
+    requires_verification = bool(
+        best_instant_bank_disc == 0.0
+        and (
+            saw_teaser_or_conditional
+            or any(g.get("gate") in ("gate1_teaser_summary", "gate4_conditional_unverified") for g in gate_audit_log)
+        )
+    )
+    verification_note = (
+        "Teaser or conditional 'up to' bank banners were found on the page without verifiable flat/percentage eligibility for your wallet. "
+        "Guaranteed instant discount is kept at ₹0 until offer drawer/T&Cs are verified."
+        if requires_verification
+        else ""
+    )
+    if requires_verification:
+        verdict_parts.append(verification_note)
+
     return CashVsPointsReport(
         listed_price=listed_price,
         coupon_discount_inr=coupon_disc,
@@ -770,6 +940,10 @@ def compute_cash_vs_points_report(
         winning_owned_card_name=winning_owned_card_name,
         winning_instant_offer_summary=winning_instant_offer_summary,
         user_wallet_empty=(len(user_cards) == 0),
+        requires_offer_verification=requires_verification,
+        offer_verification_note=verification_note,
+        emi_offers=emi_offers,
+        gate_audit_log=gate_audit_log,
         routes=routes,
         unowned_card_routes=unowned_card_routes,
         best_route_cash=best_cash.method_name if best_cash else None,
@@ -843,34 +1017,24 @@ def compute_stacked_offer_price(
             "source": "live_page",
         })
 
-    # ── Step 2: Live Bank Instant Discount ──
+    # ── Step 2: Live Bank Instant Discount (Enforcing 5-Gate Math Guard) ──
     best_bank_disc = 0.0
     best_bank_name = ""
     best_bank_rule: BankOfferRule | None = None
     winning_card: CardLike | None = None
 
     for card in user_cards:
-        for offer in bank_offers:
-            if offer.bank_name.lower() in card.bank_name.lower() or card.bank_name.lower() in offer.bank_name.lower():
-                if running_price < offer.min_txn_amount:
-                    continue
-                excluded = [e.lower() for e in (offer.excluded_cards or [])]
-                if card.card_name.lower() in excluded:
-                    continue
-
-                disc = 0.0
-                if offer.discount_flat > 0:
-                    disc = offer.discount_flat
-                elif offer.discount_pct > 0:
-                    disc = running_price * offer.discount_pct / 100.0
-                    if offer.max_discount_cap > 0:
-                        disc = min(disc, offer.max_discount_cap)
-
-                if disc > best_bank_disc:
-                    best_bank_disc = disc
-                    best_bank_name = card.card_name
-                    best_bank_rule = offer
-                    winning_card = card
+        disc, matched_rule = _best_verified_instant_discount(
+            card,
+            bank_offers,
+            running_price,
+            retailer_advertised_lowest_price=retailer_advertised_lowest_price,
+        )
+        if disc > best_bank_disc and matched_rule is not None:
+            best_bank_disc = disc
+            best_bank_name = card.card_name
+            best_bank_rule = matched_rule
+            winning_card = card
 
     if best_bank_disc > 0 and best_bank_rule:
         running_price = round(running_price - best_bank_disc, 2)
