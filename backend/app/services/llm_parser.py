@@ -8,6 +8,7 @@ Strips markdown code fences from free-model responses before Pydantic parse.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -45,41 +46,108 @@ def _strip_code_fences(text: str) -> str:
 
 
 def _deterministic_bank_offers(raw_texts: list[str]) -> list[BankOfferRule]:
-    """Instant regex parser for Indian bank offers when LLM is offline/slow."""
-    rules = []
-    seen = set()
+    """
+    Accurate deterministic parser for live Indian on-page bank offers.
+    - Extracts every bank mentioned in a line (e.g. 'HDFC, ICICI & SBI Credit Card').
+    - Never confuses min-spend or max-cap with flat discount when percentage discount is present.
+    - Parses card_type (credit/debit/emi/both), flat or %, max_discount_cap, and min_txn_amount.
+    """
+    rules: list[BankOfferRule] = []
+    seen_keys: set[tuple[str, float, float, float, float]] = set()
+    bank_pat = re.compile(
+        r"\b(hdfc|icici|sbi|axis|kotak|amex|american\s+express|citi|rbl|idfc|bob|bank\s+of\s+baroda|standard\s+chartered|hsbc|federal|onecard|one\s+card|yes\s+bank|indusind|au\s+bank|rupay)\b",
+        re.I,
+    )
+    bank_norm_map = {
+        "AMERICAN EXPRESS": "AMEX",
+        "BANK OF BARODA": "BOB",
+        "ONE CARD": "ONECARD",
+    }
+
     for text in raw_texts:
-        t = text.strip()
-        if not t or t in seen:
+        t = " ".join((text or "").split()).strip()
+        if not t or len(t) < 12:
             continue
-        seen.add(t)
-        bank_m = re.search(
-            r"\b(hdfc|icici|sbi|axis|kotak|amex|citi|rbl|idfc|bob|standard chartered|hsbc|federal|onecard|yes bank|bank of baroda)\b",
+        low = t.lower()
+        # Skip pure no-cost EMI interest-savings lines that are not instant discounts
+        if "no cost emi" in low and "instant discount" not in low and "off" not in low and "cashback" not in low:
+            continue
+
+        found_banks: list[str] = []
+        for bm in bank_pat.finditer(t):
+            b = bm.group(1).upper()
+            b = bank_norm_map.get(b, b)
+            if b not in found_banks:
+                found_banks.append(b)
+
+        # Pure UPI app offers (e.g. "₹1,101 off Google Pay UPI", "₹1,101 off PhonePe") belong to the UPI route,
+        # NEVER as an "ALL BANKS" credit card offer!
+        if not found_banks and re.search(r"\b(?:upi|google\s*pay|gpay|phonepe|paytm|cred|super\.money|bhim)\b", low):
+            continue
+
+        # Parse min spend FIRST and strip it before looking for flat discount amounts
+        min_m = re.search(
+            r"(?:min(?:imum)?\s*(?:purchase|spend|order|txn|transaction)(?:\s+value|\s+amount|\s+of)?|orders?\s+above|on\s+orders?\s+of)\s*(?:₹|Rs\.?|INR)?\s*([\d,]+)",
             t,
             re.I,
         )
-        bank_name = bank_m.group(1).upper() if bank_m else "ALL BANKS"
-        flat_m = re.search(r"(?:flat\s+)?(?:₹|Rs\.?|INR)\s*([\d,]+)", t, re.I)
-        pct_m = re.search(r"(\d+(?:\.\d+)?)\s*%\s*(?:instant\s+)?(?:discount|off)", t, re.I)
-        cap_m = re.search(r"(?:upto|up to|max(?:imum)?)\s*(?:₹|Rs\.?|INR)?\s*([\d,]+)", t, re.I)
-        min_m = re.search(r"(?:min(?:imum)?\s+spend|min\s+order|orders\s+above)\s*(?:₹|Rs\.?|INR)?\s*([\d,]+)", t, re.I)
+        min_txn = float(min_m.group(1).replace(",", "")) if min_m else 0.0
+        t_no_min = t[: min_m.start()] + " " + t[min_m.end() :] if min_m else t
 
-        flat = float(flat_m.group(1).replace(",", "")) if flat_m else 0.0
+        pct_m = re.search(r"(\d+(?:\.\d+)?)\s*%\s*(?:instant\s+)?(?:discount|off|cashback|back)", t_no_min, re.I)
+        cap_m = re.search(
+            r"(?:up\s*to|upto|max(?:imum)?(?:\s+discount)?)\s*(?:₹|Rs\.?|INR)\s*([\d,]+)",
+            t_no_min,
+            re.I,
+        )
+
         pct = float(pct_m.group(1)) if pct_m else 0.0
         cap = float(cap_m.group(1).replace(",", "")) if cap_m else 0.0
-        min_txn = float(min_m.group(1).replace(",", "")) if min_m else 0.0
+        flat = 0.0
 
-        if flat > 0 or pct > 0:
+        if pct == 0.0:
+            flat_m = re.search(
+                r"(?:flat|additional|extra|instant\s+discount\s+of|get|save|up\s*to|upto)?\s*(?:₹|Rs\.?|INR)\s*([\d,]+)(?:\.\d{1,2})?\s*(?:instant\s+discount|off|discount|cashback|back)?",
+                t_no_min,
+                re.I,
+            )
+            if flat_m:
+                cand_flat = float(flat_m.group(1).replace(",", ""))
+                if cand_flat > 0 and cand_flat != min_txn:
+                    flat = cand_flat
+
+        if flat <= 0 and pct <= 0:
+            continue
+
+        if not found_banks:
+            found_banks = ["ALL BANKS"]
+
+        if "non-emi" in low:
+            card_type = "debit" if ("debit" in low and "credit" not in low) else ("credit" if "credit" in low else "both")
+        elif "emi" in low and "non-emi" not in low:
+            card_type = "emi"
+        elif "debit" in low and "credit" not in low:
+            card_type = "debit"
+        elif "credit" in low and "debit" not in low:
+            card_type = "credit"
+        else:
+            card_type = "both"
+
+        for bname in found_banks:
+            dedup_key = (bname, flat, pct, cap, min_txn)
+            if dedup_key in seen_keys:
+                continue
+            seen_keys.add(dedup_key)
             rules.append(
                 BankOfferRule(
-                    bank_name=bank_name,
-                    card_type="emi" if "emi" in t.lower() else ("credit" if "credit" in t.lower() else "both"),
-                    card_network="any",
+                    bank_name=bname,
+                    card_type=card_type,  # type: ignore[arg-type]
+                    card_network="rupay" if "rupay" in low else ("amex" if bname == "AMEX" else "any"),
                     min_txn_amount=min_txn,
                     discount_flat=flat,
                     discount_pct=pct,
                     max_discount_cap=cap,
-                    summary=t[:120],
+                    summary=t[:160],
                 )
             )
     return rules
@@ -87,13 +155,14 @@ def _deterministic_bank_offers(raw_texts: list[str]) -> list[BankOfferRule]:
 
 def _deterministic_variant(title: str, specs_text: str = "") -> VariantAttributes:
     """Instant regex parser for product specs when LLM is offline/slow."""
+    from app.services.product_matcher import extract_clean_brand
+
     combined = f"{title} {specs_text}"
     ram_m = re.search(r"(\d+)\s*GB\s*RAM", combined, re.I)
     stor_m = re.search(r"(\d+)\s*(?:GB|TB)\s*(?:ROM|Storage|SSD|Internal|Space)", combined, re.I)
     color_m = re.search(r"\b(Black|White|Blue|Gold|Silver|Red|Green|Purple|Titanium|Midnight|Starlight|Natural|Yellow|Pink)\b", combined, re.I)
-    brand_m = re.search(r"\b(Apple|Samsung|OnePlus|Xiaomi|Realme|Motorola|Vivo|Oppo|Google|Sony|Asus|Lenovo|HP|Dell|Acer|Nothing|iQOO)\b", combined, re.I)
 
-    brand = brand_m.group(1) if brand_m else "Generic"
+    brand = extract_clean_brand(None, title) or "Unknown"
     storage = int(stor_m.group(1)) if stor_m else None
     if stor_m and "tb" in stor_m.group(0).lower():
         storage = storage * 1024
@@ -173,7 +242,7 @@ class LLMParser:
         return AsyncOpenAI(
             base_url="https://openrouter.ai/api/v1",
             api_key=settings.openrouter_api_key,
-            timeout=12.0,  # 12-second hard limit on any OpenRouter HTTP call
+            timeout=6.0,  # 6-second hard limit on any OpenRouter HTTP call
         )
 
     # ── Cache ────────────────────────────────
@@ -196,7 +265,7 @@ class LLMParser:
 
     # ── Core LLM call ───────────────────────
 
-    async def _call(self, prompt: str, schema: type[T], timeout: float = 12.0) -> T:
+    async def _call(self, prompt: str, schema: type[T], timeout: float = 6.0) -> T:
         if self._client is None:
             raise LLMParserError(
                 "OPENROUTER_API_KEY not configured. Set it in .env"
@@ -240,15 +309,15 @@ class LLMParser:
         if not raw_texts:
             return []
 
-        # Deduplicate and bound raw texts to at most 4 clean items (max 250 chars each)
+        # Deduplicate and bound raw texts to at most 12 clean items (max 280 chars each)
         cleaned_texts = []
         seen = set()
         for t in raw_texts:
-            clean = t.strip()[:250]
+            clean = t.strip()[:280]
             if clean and clean not in seen:
                 seen.add(clean)
                 cleaned_texts.append(clean)
-            if len(cleaned_texts) >= 4:
+            if len(cleaned_texts) >= 12:
                 break
 
         combined = "\n---\n".join(cleaned_texts)

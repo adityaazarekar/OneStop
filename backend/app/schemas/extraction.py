@@ -27,10 +27,14 @@ class LiveOfferRaw(BaseModel):
     """Raw offer tagged directly from the live product page."""
 
     title: str
-    offer_type: str = "general"  # bank, coupon, emi, cashback, upi, special
+    offer_type: str = "general"  # bank, coupon, emi, cashback, upi, fee, special
     raw_text: str
     source: Literal["live_page", "stack_optimization"] = "live_page"
     conditions: str = ""
+    bank_or_app: str | None = None
+    payment_type: str | None = None  # credit_card, debit_card, upi, emi, coupon, fee
+    discount_inr: float | None = None
+    coupon_scope: str | None = None  # current_item_coupon | cross_sell | future_order | None
 
 
 class ClientPayload(BaseModel):
@@ -40,9 +44,10 @@ class ClientPayload(BaseModel):
     url: str
     title: str
     brand: str | None = None
-    sku: str = Field(description="ASIN, FSN, or retailer-specific product ID")
+    sku: str = Field(default="", description="ASIN, FSN, or retailer-specific product ID")
     listed_price: float | None = None
     mrp: float | None = None
+    retailer_advertised_lowest_price: float | None = None
     in_stock: bool = True
     seller_name: str | None = None
     seller_rating: float | None = None
@@ -78,6 +83,11 @@ class ClientPayload(BaseModel):
     @classmethod
     def _coerce_none_dict(cls, v):
         return v if v is not None else {}
+
+    @field_validator("sku", mode="before")
+    @classmethod
+    def _coerce_none_str(cls, v):
+        return str(v) if v is not None else ""
     extracted_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc)
     )
@@ -102,6 +112,9 @@ class CompetitorQuote(BaseModel):
     warranty_notes: str | None = None
     delivery_fee: float = 0.0
     bank_offer_summary: str | None = None
+    match_score: float | None = None
+    extraction_tier: str | None = None
+    source: str | None = None  # "extension_offscreen" | "searxng" | "serper"
 
 
 class AnalyzePayloadRequest(BaseModel):
@@ -278,7 +291,7 @@ class StackStep(BaseModel):
     description: str
     amount_deducted: float
     running_price: float
-    verification_status: Literal["verified_on_page", "stack_path", "fee"] = "verified_on_page"
+    verification_status: Literal["verified_on_page", "stack_path", "fee", "post_purchase"] = "verified_on_page"
 
 
 class AlternativeOptimizationPath(BaseModel):
@@ -333,7 +346,10 @@ class StoreRankingChoice(BaseModel):
     store_name: str
     url: str
     listed_price: float
+    checkout_cash_price: float = 0.0
+    best_user_card_net_price: float = 0.0
     effective_price: float
+    is_current_store: bool = False
     seller_name: str = ""
     peace_of_mind_score: int = 50
     return_terms: str = ""
@@ -354,6 +370,105 @@ class ExecutiveSummary(BaseModel):
     why_this_wins: str = ""
     key_caveat: str = ""
     summary_bullets: list[str] = Field(default_factory=list)
+
+
+# ───────────────────────────────────────────
+# Live Payment T&C Rules + Cash-vs-Points Transparency
+# ───────────────────────────────────────────
+VerificationStatus = Literal["page_verified", "live_tc_verified", "no_verified_offer"]
+
+
+class VerifiedPaymentRule(BaseModel):
+    """One payment method's reward/discount rule, verified from page or live official T&C."""
+
+    method_name: str
+    method_type: Literal["credit_card", "debit_card", "gift_voucher", "upi_app", "wallet", "emi"] = "credit_card"
+    instant_discount_inr: float = 0.0
+    max_discount_cap_inr: float | None = None
+    reward_type: Literal["points", "cashback", "miles", "voucher_discount", "none"] = "none"
+    points_per_spend_unit: float = 0.0
+    spend_unit_inr: float = 100.0
+    point_value_cash_inr: float = 0.0
+    point_value_travel_inr: float = 0.0
+    monthly_cap_inr: float | None = None
+    processing_fee_pct: float = 0.0
+    exclusions: list[str] = Field(default_factory=list)
+    stackable_with: list[str] = Field(default_factory=list)
+    verification_status: VerificationStatus = "no_verified_offer"
+    source_urls: list[str] = Field(default_factory=list)
+    last_verified_at: datetime | None = None
+    plain_english_summary: str = ""
+
+
+class VerifiedPaymentRuleList(BaseModel):
+    rules: list[VerifiedPaymentRule] = Field(default_factory=list)
+
+
+class PostPurchaseRewards(BaseModel):
+    """Value credited AFTER purchase. Never deducted from checkout_payable_inr."""
+
+    reward_type: str = "none"
+    points_earned: float = 0.0
+    conversion_ratio_cash: str = ""  # e.g. "3.33 pts = ₹1 statement cash (₹0.30/pt)"
+    conversion_ratio_travel: str = ""  # e.g. "1 pt = ₹1.00 travel"
+    cash_value_inr: float = 0.0
+    travel_value_inr: float = 0.0
+    monthly_cap_inr: float | None = None
+    cap_applied: bool = False
+    processing_fee_inr: float = 0.0
+
+
+class PaymentRouteAnalysis(BaseModel):
+    route_type: Literal["direct_points_card", "direct_cashback_card", "gift_voucher_stack", "upi_app_offer", "unowned_card"]
+    route_label: str
+    method_name: str
+    is_owned_card: bool = True
+    available: bool = True
+    checkout_payable_inr: float
+    instant_discount_inr: float = 0.0
+    rewards: PostPurchaseRewards = Field(default_factory=PostPurchaseRewards)
+    effective_cost_if_cash_inr: float
+    effective_cost_if_optimal_redemption_inr: float
+    verification_status: VerificationStatus = "no_verified_offer"
+    source_urls: list[str] = Field(default_factory=list)
+    exclusions: list[str] = Field(default_factory=list)
+    last_verified_at: datetime | None = None
+    summary: str = ""
+
+
+class CashVsPointsReport(BaseModel):
+    listed_price: float
+    coupon_discount_inr: float = 0.0
+    mandatory_fees_inr: float = 0.0
+    instant_bank_discount_inr: float = 0.0
+    checkout_payable_inr: float
+    best_user_card_net_price_cash: float = 0.0
+    best_user_card_net_price_optimal: float = 0.0
+    winning_owned_card_name: str | None = None
+    winning_instant_offer_summary: str | None = None
+    user_wallet_empty: bool = False
+    routes: list[PaymentRouteAnalysis] = Field(default_factory=list)
+    unowned_card_routes: list[PaymentRouteAnalysis] = Field(default_factory=list)
+    best_route_cash: str | None = None
+    best_route_optimal: str | None = None
+    efficiency_verdict: str = ""
+    terms_last_verified_at: datetime | None = None
+
+
+# ───────────────────────────────────────────
+# Stage-2 universal store discovery
+# ───────────────────────────────────────────
+class DiscoverStoresRequest(BaseModel):
+    payload: ClientPayload
+    max_stores: int = Field(default=8, ge=1, le=15)
+
+
+class DiscoverStoresResponse(BaseModel):
+    query: str
+    quotes: list[CompetitorQuote] = Field(default_factory=list)
+    rejected_count: int = 0
+    cached: bool = False
+    errors: list[str] = Field(default_factory=list)
 
 
 class AnalysisResponse(BaseModel):
@@ -378,6 +493,7 @@ class AnalysisResponse(BaseModel):
     seller_report: MultiSellerReport | None = None
     ranked_store_choices: list[StoreRankingChoice] = Field(default_factory=list)
     llm_summary: ExecutiveSummary | None = None
+    cash_vs_points: CashVsPointsReport | None = None
 
 
 class EffectivePriceRequest(BaseModel):

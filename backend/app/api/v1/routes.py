@@ -14,6 +14,7 @@ from datetime import date, datetime, timezone
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 logger = logging.getLogger(__name__)
 
@@ -29,14 +30,19 @@ from app.schemas.extraction import (
     BankOfferRule,
     BuyWaitVerdictResponse,
     CardResultResponse,
+    CashVsPointsReport,
     ClientPayload,
     CompetitorQuote,
+    DiscoverStoresRequest,
+    DiscoverStoresResponse,
+    DynamicSellerInfo,
     EffectivePriceRequest,
     EffectivePriceResponse,
     ExchangeComparisonResponse,
     ExchangeOptionResponse,
     ExecutiveSummary,
     ListingSnapshot,
+    LiveOfferRaw,
     MissedSavingResponse,
     MultiSellerReport,
     ScraperResult,
@@ -52,11 +58,17 @@ from app.services.card_optimizer import (
     calculate_effective_prices,
 )
 from app.services.exchange_arbitrage import compare_exchange_options
+from app.services.live_terms_engine import resolve_live_payment_rules
 from app.services.llm_parser import get_llm_parser
-from app.services.offer_stack_engine import compute_stacked_offer_price
+from app.services.offer_stack_engine import (
+    compute_cash_vs_points_report,
+    compute_stacked_offer_price,
+)
 from app.services.product_matcher import match_or_create
 from app.services.seller_forensics import analyze_dynamic_sellers, compute_trust_score
+from app.services.shopping_discovery import discover_stores
 from app.services.store_ranker import rank_stores_fairly
+from app.services.universal_scraper import extract_from_url, is_blocked_non_retailer_domain
 from app.services.vault_service import (
     days_remaining,
     get_vault_items,
@@ -93,13 +105,29 @@ def _card_result_to_response(cr) -> CardResultResponse:
     )
 
 
+def _parse_valid_uuids(raw_ids: list[str] | None) -> list[uuid.UUID]:
+    out: list[uuid.UUID] = []
+    for raw in raw_ids or []:
+        if not raw:
+            continue
+        for part in str(raw).split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                out.append(uuid.UUID(part))
+            except ValueError:
+                pass
+    return out
+
+
 async def _process_competitor_quotes(
     quotes: list[CompetitorQuote],
     canonical_product: CanonicalProduct,
     session: AsyncSession,
     variant_specs: dict,
 ) -> list[ListingSnapshot]:
-    """Persist valid competitor quotes as listings + price observations, discarding variant mismatches."""
+    """Persist valid transactional competitor quotes as listings + price observations, blocking aggregators."""
     from app.services.product_matcher import (
         _variant_specs_match,
         extract_variant_specs_from_title,
@@ -116,6 +144,8 @@ async def _process_competitor_quotes(
     for q in quotes:
         if not q.listed_price or q.listed_price <= 0:
             continue
+        if is_blocked_non_retailer_domain(q.url) or is_blocked_non_retailer_domain(q.retailer):
+            continue
         # Variant check: reject if title clearly indicates different storage/RAM/tier/accessories
         quote_specs = extract_variant_specs_from_title(q.title)
 
@@ -123,13 +153,15 @@ async def _process_competitor_quotes(
             continue  # Wrong variant — skip
 
         # Upsert listing
-        sku = q.sku or f"CQ-{q.retailer}-{abs(hash(q.url)) % 10**8}"
+        retailer_clean = (q.retailer or "generic")[:20]
+        sku = (q.sku or f"CQ-{retailer_clean}-{abs(hash(q.url)) % 10**8}")[:100]
         stmt = select(RetailerListing).where(
-            RetailerListing.retailer == q.retailer,
+            RetailerListing.retailer == retailer_clean,
             RetailerListing.external_sku == sku,
         )
         existing = (await session.execute(stmt)).scalar_one_or_none()
         if existing:
+            existing.canonical_product_id = canonical_product.id
             existing.current_listed_price = q.listed_price
             existing.in_stock = q.in_stock
             existing.last_checked_at = datetime.now(timezone.utc)
@@ -138,9 +170,9 @@ async def _process_competitor_quotes(
             listing = RetailerListing(
                 id=uuid.uuid4(),
                 canonical_product_id=canonical_product.id,
-                retailer=q.retailer,
+                retailer=retailer_clean,
                 external_sku=sku,
-                listing_url=q.url,
+                listing_url=(q.url or "")[:1000],
                 current_listed_price=q.listed_price,
                 in_stock=q.in_stock,
                 match_confidence=0.7,
@@ -159,7 +191,7 @@ async def _process_competitor_quotes(
         session.add(obs)
 
         valid_snaps.append(ListingSnapshot(
-            retailer=q.retailer,
+            retailer=retailer_clean,
             listing_url=q.url,
             listed_price=q.listed_price,
             in_stock=q.in_stock,
@@ -244,26 +276,28 @@ async def _run_analysis_pipeline(
         )
         session.add(db_offer)
 
-    # 5. Load user cards
-    if user_card_ids:
-        uuids = [uuid.UUID(cid) for cid in user_card_ids]
-        stmt = select(CreditCard).where(CreditCard.id.in_(uuids))
+    # 5. Load user cards STRICTLY from user_card_ids (never treat unowned cards as owned!)
+    parsed_user_uuids = _parse_valid_uuids(user_card_ids)
+    if parsed_user_uuids:
+        stmt = select(CreditCard).where(CreditCard.id.in_(parsed_user_uuids))
+        result = await session.execute(stmt)
+        cards_db = list(result.scalars().all())
+        user_cards = [_card_to_cardlike(c) for c in cards_db]
     else:
-        stmt = select(CreditCard)
-    result = await session.execute(stmt)
-    cards_db = list(result.scalars().all())
-    user_cards = [_card_to_cardlike(c) for c in cards_db]
+        user_cards = []
 
-    # All cards for missed-savings
+    # All cards for separate "Other Cards (Not in Your Wallet)" & missed-savings comparison
     all_cards_result = await session.execute(select(CreditCard))
     all_cards = [_card_to_cardlike(c) for c in all_cards_result.scalars().all()]
+    owned_names_set = {c.card_name.lower() for c in user_cards}
+    unowned_cards = [c for c in all_cards if c.card_name.lower() not in owned_names_set]
 
-    # 6. Card optimizer
+    # 6. Card optimizer (strictly on user's owned cards)
     listed = payload.listed_price or 0.0
     opt_result = calculate_effective_prices(
         listed_price=listed,
         coupon_discount=0.0,
-        platform_fee=0.0,
+        platform_fee=round((payload.delivery_fee or 0.0) + (payload.handling_fee or 0.0), 2),
         bank_offers=parsed_offers,
         user_cards=user_cards,
         retailer=payload.retailer,
@@ -283,6 +317,7 @@ async def _run_analysis_pipeline(
             delivery_fee=payload.delivery_fee or 0.0,
             handling_fee=payload.handling_fee or 0.0,
             all_cards=all_cards,
+            retailer_advertised_lowest_price=payload.retailer_advertised_lowest_price,
         )
     except Exception as exc:
         logger.warning(f"Dynamic offer stacking failed ({exc}) — using basic price")
@@ -295,6 +330,32 @@ async def _run_analysis_pipeline(
             alternative_paths=[],
             notes=str(exc),
         )
+
+    # 6c. Strict Cash-vs-Points Financial Transparency & Live T&C Rules (Zero Fake Estimates)
+    verified_rules = []
+    cash_vs_points: CashVsPointsReport | None = None
+    try:
+        verified_rules = await resolve_live_payment_rules(
+            retailer=payload.retailer or "amazon_in",
+            user_cards=user_cards,
+            allow_live_crawl=False,  # Stage 1 reads 7-day Redis T&C cache (<20ms); live crawl on demand
+            timeout_seconds=2.5,
+        )
+        cash_vs_points = compute_cash_vs_points_report(
+            listed_price=listed,
+            raw_coupons=payload.raw_coupons or [],
+            bank_offers=parsed_offers,
+            user_cards=user_cards,
+            retailer=payload.retailer or "amazon_in",
+            verified_rules=verified_rules,
+            raw_live_offers=payload.raw_live_offers or [],
+            delivery_fee=payload.delivery_fee or 0.0,
+            handling_fee=payload.handling_fee or 0.0,
+            unowned_cards=unowned_cards,
+            retailer_advertised_lowest_price=payload.retailer_advertised_lowest_price,
+        )
+    except Exception as exc:
+        logger.warning(f"Cash-vs-Points computation failed ({exc})")
 
     # 7. Seller forensics & Dynamic Multi-Seller Fact-Check
     try:
@@ -354,16 +415,21 @@ async def _run_analysis_pipeline(
             reasoning="Price observation logged. More observations needed.",
         )
 
-    # 9. Process competitor quotes from extension
+    # 9. Process competitor quotes from extension (blocking aggregators/non-retailers)
     comp_snaps: list[ListingSnapshot] = []
     if competitor_quotes:
         comp_snaps = await _process_competitor_quotes(
             competitor_quotes, product, session, variant.model_dump() if variant else {},
         )
 
+    # Explicitly commit CanonicalProduct, RetailerListing, PriceObservation & refresh BEFORE returning canonical_product_id
     await session.commit()
+    try:
+        await session.refresh(product)
+    except Exception:
+        pass
 
-    # Build listings snapshot
+    # Build listings snapshot (filtering out any legacy blocked non-retailer rows)
     all_listings_stmt = (
         select(RetailerListing)
         .where(RetailerListing.canonical_product_id == product.id)
@@ -382,6 +448,8 @@ async def _run_analysis_pipeline(
         )
         for l in all_listings
         if hasattr(l, "retailer")
+        and not is_blocked_non_retailer_domain(getattr(l, "listing_url", "") or "")
+        and not is_blocked_non_retailer_domain(getattr(l, "retailer", "") or "")
     ]
     if not listing_snaps and listing:
         listing_snaps = [
@@ -397,16 +465,22 @@ async def _run_analysis_pipeline(
             )
         ]
 
-    # 10. Fair Multi-Site Ranking (Unbiased ranking across all platforms)
+    # 10. Fair Multi-Site Ranking (Uniform 2-metric comparison, deduplicated Current Page)
+    cur_checkout_cash = cash_vs_points.checkout_payable_inr if cash_vs_points else listed
+    cur_best_net = cash_vs_points.best_user_card_net_price_cash if cash_vs_points else cur_checkout_cash
     try:
         ranked_store_choices = rank_stores_fairly(
             current_retailer=payload.retailer or "store",
-            current_price=stacked_offers.best_stacked_price if stacked_offers else listed,
+            current_listed_price=listed,
+            current_checkout_cash_price=cur_checkout_cash,
+            current_best_user_card_net_price=cur_best_net,
             current_url=payload.url or "",
             current_seller=multi_seller_report.recommended_seller or payload.seller_name or "Official Seller",
             current_peace_of_mind=trust_report.trust_score if trust_report else 70,
             competitors=competitor_quotes or [],
             existing_listings=listing_snaps,
+            user_cards=user_cards,
+            verified_rules=verified_rules,
         )
     except Exception as exc:
         logger.warning(f"Fair store ranking failed ({exc}) — using empty list")
@@ -507,12 +581,19 @@ async def _run_analysis_pipeline(
         seller_report=multi_seller_report,
         ranked_store_choices=ranked_store_choices,
         llm_summary=exec_summary,
+        cash_vs_points=cash_vs_points,
     )
 
 
 # ═══════════════════════════════════════════
 # ENDPOINTS
 # ═══════════════════════════════════════════
+
+
+@router.post("/discover-stores", response_model=DiscoverStoresResponse)
+async def discover_stores_endpoint(req: DiscoverStoresRequest):
+    """Stage 2 universal cross-store discovery via SearXNG + 3-Tier Scrapling + RapidFuzz."""
+    return await discover_stores(req.payload, max_stores=req.max_stores)
 
 
 @router.post("/analyze-client-payload", response_model=AnalysisResponse)
@@ -535,7 +616,12 @@ async def analyze_url(
     card_ids: list[str] = Query(default=[]),
     session: AsyncSession = Depends(get_db),
 ):
-    """Server-side scrape fallback for direct URL pastes on web dashboard."""
+    """Server-side universal scrape for direct URL pastes on web dashboard (any site)."""
+    # Try 3-Tier universal Scrapling + extruct scraper first (handles short links + any store)
+    uni_payload, tier_info = await extract_from_url(url, allow_tier2=True)
+    if uni_payload and uni_payload.listed_price and uni_payload.listed_price > 0:
+        return await _run_analysis_pipeline(uni_payload, session, card_ids or None)
+
     from app.scrapers.base_scraper import resolve_url_redirects
     canonical_url = await resolve_url_redirects(url)
     scraper = get_scraper(canonical_url)
@@ -544,12 +630,12 @@ async def analyze_url(
     except ScraperError as exc:
         raise HTTPException(
             status_code=502,
-            detail=f"Live fetch failed: {exc}. Use Chrome Extension or App for ₹0 extraction.",
+            detail=f"Live fetch failed ({tier_info}; {exc}). Use Chrome Extension or App for ₹0 extraction.",
         )
     if not result.success or result.payload is None:
         raise HTTPException(
             status_code=502,
-            detail=result.error or "Scraper returned no data. Use Extension/App instead.",
+            detail=result.error or f"Scraper returned no data ({tier_info}). Use Extension/App instead.",
         )
     return await _run_analysis_pipeline(result.payload, session, card_ids or None)
 
@@ -560,15 +646,15 @@ async def calculate_effective_price(
     session: AsyncSession = Depends(get_db),
 ):
     """Instant card wallet recalculation without full scrape."""
-    # Load requested cards
-    if req.card_ids:
-        uuids = [uuid.UUID(cid) for cid in req.card_ids]
-        stmt = select(CreditCard).where(CreditCard.id.in_(uuids))
+    # Load requested cards STRICTLY (empty card_ids => no owned cards, not all DB cards)
+    parsed_req_uuids = _parse_valid_uuids(req.card_ids)
+    if parsed_req_uuids:
+        stmt = select(CreditCard).where(CreditCard.id.in_(parsed_req_uuids))
+        result = await session.execute(stmt)
+        cards_db = list(result.scalars().all())
+        user_cards = [_card_to_cardlike(c) for c in cards_db]
     else:
-        stmt = select(CreditCard)
-    result = await session.execute(stmt)
-    cards_db = list(result.scalars().all())
-    user_cards = [_card_to_cardlike(c) for c in cards_db]
+        user_cards = []
 
     all_result = await session.execute(select(CreditCard))
     all_cards = [_card_to_cardlike(c) for c in all_result.scalars().all()]
@@ -657,21 +743,41 @@ async def list_recent_products(
 @router.get("/products/{canonical_id}")
 async def get_product_details(
     canonical_id: str,
+    card_ids: list[str] = Query(default=[]),
+    live_terms: bool = Query(default=False),
     session: AsyncSession = Depends(get_db),
 ):
-    """Return details and live listings for a canonical product."""
+    """Return details, live listings, and Cash-vs-Points analysis for a canonical product."""
+    clean_id = (canonical_id or "").strip()
     try:
-        product_uuid = uuid.UUID(canonical_id)
+        product_uuid = uuid.UUID(clean_id)
     except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid canonical product UUID")
+        raise HTTPException(
+            status_code=404,
+            detail=f"Product not found: '{clean_id}' is not a valid canonical product UUID.",
+        )
 
-    stmt = select(CanonicalProduct).where(CanonicalProduct.id == product_uuid)
+    stmt = (
+        select(CanonicalProduct)
+        .options(selectinload(CanonicalProduct.listings).selectinload(RetailerListing.bank_offer_rules))
+        .where(CanonicalProduct.id == product_uuid)
+    )
     result = await session.execute(stmt)
     product = result.scalar_one_or_none()
     if not product:
-        raise HTTPException(status_code=404, detail="Product not found")
+        raise HTTPException(
+            status_code=404,
+            detail=f"Product not found in database for canonical_product_id={product_uuid}.",
+        )
 
-    listings = [l for l in (product.listings or []) if l.current_listed_price and l.current_listed_price > 0]
+    listings = [
+        l
+        for l in (product.listings or [])
+        if l.current_listed_price
+        and l.current_listed_price > 0
+        and not is_blocked_non_retailer_domain(l.listing_url or "")
+        and not is_blocked_non_retailer_domain(l.retailer or "")
+    ]
     cheapest_listing = None
     if listings:
         cheapest_listing = min(
@@ -698,10 +804,38 @@ async def get_product_details(
     seller_report_data = None
     ranked_store_choices_data = []
     llm_summary_data = None
+    cash_vs_points_data = None
+
+    # Parse optional comma-separated or repeated card_ids STRICTLY
+    parsed_card_uuids = _parse_valid_uuids(card_ids)
+    if parsed_card_uuids:
+        c_res = await session.execute(select(CreditCard).where(CreditCard.id.in_(parsed_card_uuids)))
+        wallet_cards = [_card_to_cardlike(c) for c in c_res.scalars().all()]
+    else:
+        wallet_cards = []
+
+    all_c_res = await session.execute(select(CreditCard))
+    all_db_cards = [_card_to_cardlike(c) for c in all_c_res.scalars().all()]
+    owned_names = {c.card_name.lower() for c in wallet_cards}
+    unowned_cards = [c for c in all_db_cards if c.card_name.lower() not in owned_names]
 
     if cheapest_listing and cheapest_listing.current_listed_price and cheapest_listing.current_listed_price > 0:
         cheapest_price = cheapest_listing.current_listed_price
         parser = await get_llm_parser()
+
+        bank_offer_schemas = [
+            BankOfferRule(
+                bank_name=bo.bank_name,
+                card_type=bo.card_type if bo.card_type in ("credit", "debit", "both", "emi") else None,
+                min_txn_amount=bo.min_txn_amount or 0.0,
+                discount_flat=bo.discount_flat or 0.0,
+                discount_pct=bo.discount_pct or 0.0,
+                max_discount_cap=bo.max_discount_cap or 0.0,
+                excluded_cards=(bo.excluded_cards or {}).get("excluded", []) if isinstance(bo.excluded_cards, dict) else [],
+                summary=bo.raw_terms or f"{bo.bank_name} discount",
+            )
+            for bo in (cheapest_listing.bank_offer_rules or [])
+        ]
 
         live_offers_for_stack = [
             LiveOfferRaw(
@@ -717,31 +851,64 @@ async def get_product_details(
             stacked = compute_stacked_offer_price(
                 listed_price=cheapest_price,
                 raw_coupons=[],
-                bank_offers=[],
-                user_cards=[],
+                bank_offers=bank_offer_schemas,
+                user_cards=wallet_cards,
                 retailer=cheapest_listing.retailer,
                 raw_live_offers=live_offers_for_stack,
                 delivery_fee=0.0,
                 handling_fee=0.0,
+                all_cards=all_db_cards,
             )
             stacked_offers_data = stacked.model_dump()
         except Exception as exc:
             logger.warning(f"Failed to compute stacked offer price in get_product_details: {exc}")
             stacked_offers_data = None
+            stacked = StackedEffectivePriceResult(
+                original_listed_price=cheapest_price,
+                best_stacked_price=cheapest_price,
+                total_savings=0.0,
+            )
 
-        seller_list = []
+        verified_rules = []
+        cvp_obj: CashVsPointsReport | None = None
+        try:
+            verified_rules = await resolve_live_payment_rules(
+                retailer=cheapest_listing.retailer,
+                user_cards=wallet_cards,
+                allow_live_crawl=live_terms,
+                timeout_seconds=12.0 if live_terms else 2.5,
+            )
+            cvp_obj = compute_cash_vs_points_report(
+                listed_price=cheapest_price,
+                raw_coupons=[],
+                bank_offers=bank_offer_schemas,
+                user_cards=wallet_cards,
+                retailer=cheapest_listing.retailer,
+                verified_rules=verified_rules,
+                raw_live_offers=live_offers_for_stack,
+                delivery_fee=0.0,
+                handling_fee=0.0,
+                unowned_cards=unowned_cards,
+            )
+            cash_vs_points_data = cvp_obj.model_dump()
+        except Exception as exc:
+            logger.warning(f"Failed to compute cash_vs_points in get_product_details: {exc}")
+
+        seller_list: list[DynamicSellerInfo] = []
         for l in listings:
             if l.seller_name:
-                seller_list.append({
-                    "seller_name": l.seller_name,
-                    "price": l.current_listed_price,
-                    "rating": l.seller_rating,
-                    "review_count": None,
-                    "fulfillment": "Authorized Retail Partner" if l.retailer in ("croma", "reliance_digital", "vijaysales", "tatacliq") else "Marketplace Dispatch",
-                    "return_policy": "7-14 Days Return Policy",
-                    "warranty_notes": "1 Year Manufacturer Warranty",
-                    "is_buy_box_winner": (l.id == cheapest_listing.id),
-                })
+                seller_list.append(
+                    DynamicSellerInfo(
+                        seller_name=l.seller_name,
+                        price=l.current_listed_price,
+                        rating=l.seller_rating,
+                        review_count=None,
+                        fulfillment="Authorized Retail Partner" if l.retailer in ("croma", "reliance_digital", "vijaysales", "tatacliq") else "Marketplace Dispatch",
+                        return_policy="7-14 Days Return Policy",
+                        warranty_notes="1 Year Manufacturer Warranty",
+                        is_buy_box_winner=(l.id == cheapest_listing.id),
+                    )
+                )
         seller_report = analyze_dynamic_sellers(
             sellers=seller_list,
             review_signals=None,
@@ -767,14 +934,20 @@ async def get_product_details(
             for l in listings
             if l.current_listed_price and l.current_listed_price > 0
         ]
+        cur_cash_price = cvp_obj.checkout_payable_inr if cvp_obj else cheapest_price
+        cur_net_price = cvp_obj.best_user_card_net_price_cash if cvp_obj else cur_cash_price
         ranked_stores = rank_stores_fairly(
             current_retailer=cheapest_listing.retailer,
-            current_price=stacked.best_stacked_price,
+            current_listed_price=cheapest_price,
+            current_checkout_cash_price=cur_cash_price,
+            current_best_user_card_net_price=cur_net_price,
             current_url=cheapest_listing.listing_url or "",
             current_seller=seller_report.recommended_seller or cheapest_listing.seller_name or "Official Seller",
             current_peace_of_mind=cheapest_listing.trust_score or 75,
             competitors=[],
             existing_listings=listing_snaps,
+            user_cards=wallet_cards,
+            verified_rules=verified_rules,
         )
         ranked_store_choices_data = [r.model_dump() for r in ranked_stores]
 
@@ -859,7 +1032,7 @@ async def get_product_details(
                         "discount_pct": bo.discount_pct,
                         "max_discount_cap": bo.max_discount_cap,
                         "min_txn_amount": bo.min_txn_amount,
-                        "summary": bo.summary,
+                        "summary": getattr(bo, "raw_terms", None) or "",
                     }
                     for bo in (l.bank_offer_rules or [])
                 ],
@@ -871,6 +1044,7 @@ async def get_product_details(
         "seller_report": seller_report_data,
         "ranked_store_choices": ranked_store_choices_data,
         "llm_summary": llm_summary_data,
+        "cash_vs_points": cash_vs_points_data,
     }
 
 
@@ -881,7 +1055,10 @@ async def product_price_history(
     session: AsyncSession = Depends(get_db),
 ):
     """TimescaleDB price history for a canonical product."""
-    product_uuid = uuid.UUID(canonical_id)
+    try:
+        product_uuid = uuid.UUID((canonical_id or "").strip())
+    except ValueError:
+        raise HTTPException(status_code=404, detail=f"Invalid canonical product UUID: '{canonical_id}'")
     # Get all listings for this product
     listings_stmt = select(RetailerListing.id, RetailerListing.retailer).where(
         RetailerListing.canonical_product_id == product_uuid

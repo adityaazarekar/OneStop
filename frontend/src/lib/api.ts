@@ -34,9 +34,17 @@ export async function fetchRecentProducts(limit = 12): Promise<RecentProduct[]> 
   }
 }
 
-export async function fetchProductDetails(id: string): Promise<ProductDetails | null> {
+export async function fetchProductDetails(
+  id: string,
+  cardIds: string[] = [],
+  liveTerms = false
+): Promise<ProductDetails | null> {
   try {
-    const res = await fetch(`${API_BASE}/products/${id}`, { cache: "no-store" });
+    const params = new URLSearchParams();
+    cardIds.forEach((cid) => params.append("card_ids", cid));
+    if (liveTerms) params.set("live_terms", "true");
+    const qs = params.toString();
+    const res = await fetch(`${API_BASE}/products/${id}${qs ? `?${qs}` : ""}`, { cache: "no-store" });
     if (!res.ok) return null;
     return res.json();
   } catch (err) {

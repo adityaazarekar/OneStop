@@ -20,20 +20,14 @@ export function CardWalletBar({ onCardsChanged }: Props) {
       const allCards = await fetchCards();
       setCards(allCards);
 
-      // Restore saved cards from localStorage
+      // Restore saved cards from localStorage (respect explicit empty [] selection!)
       try {
         const saved = localStorage.getItem("onestop_user_card_ids");
-        if (saved) {
+        if (saved !== null) {
           const parsed = JSON.parse(saved);
-          if (Array.isArray(parsed) && parsed.length > 0) {
+          if (Array.isArray(parsed)) {
             setSelectedIds(parsed);
             onCardsChanged?.(parsed);
-          } else if (allCards.length > 0) {
-            // Default to top 2 popular Indian cards (HDFC Infinia, ICICI Amazon Pay)
-            const defaults = allCards.slice(0, 3).map((c) => c.id);
-            setSelectedIds(defaults);
-            localStorage.setItem("onestop_user_card_ids", JSON.stringify(defaults));
-            onCardsChanged?.(defaults);
           }
         } else if (allCards.length > 0) {
           const defaults = allCards.slice(0, 3).map((c) => c.id);

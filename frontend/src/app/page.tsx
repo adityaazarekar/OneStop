@@ -85,9 +85,10 @@ export default function HomePage() {
         </h1>
 
         <p className="text-sm sm:text-base text-slate-400 max-w-2xl mx-auto leading-relaxed">
-          Paste any Amazon.in, Flipkart, Croma, or Indian store URL. Our engine calculates
-          exact credit card rewards, uncovers fake MRP hikes, verifies authorized sellers, and
-          tracks cross-store prices in real time.
+          Paste any Amazon.in, Flipkart, Croma, Myntra, or D2C store URL. Strict{" "}
+          <strong className="text-slate-200">Payable Today vs. Post-Purchase Rewards</strong>{" "}
+          transparency — separating guaranteed checkout cash from card points, GyFTR vouchers,
+          UPI offers, and verified cross-store prices.
         </p>
 
         {/* ── Paste-URL Bar ── */}
@@ -284,9 +285,11 @@ export default function HomePage() {
           <div className="p-12 text-center text-xs text-slate-500">
             Loading tracked products from database...
           </div>
-        ) : recentProducts.length > 0 ? (
+        ) : recentProducts.filter((p) => p.lowest_price != null && p.lowest_price > 0).length > 0 ? (
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
-            {recentProducts.map((p) => {
+            {recentProducts
+              .filter((p) => p.lowest_price != null && p.lowest_price > 0)
+              .map((p) => {
               const discountPct =
                 p.lowest_price && p.highest_mrp && p.highest_mrp > p.lowest_price
                   ? Math.round(((p.highest_mrp - p.lowest_price) / p.highest_mrp) * 100)

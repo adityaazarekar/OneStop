@@ -27,6 +27,7 @@ import {
   CartesianGrid,
 } from "recharts";
 import { CardWalletBar } from "@/components/CardWalletBar";
+import { CashVsPointsSection } from "@/components/CashVsPointsSection";
 import {
   fetchProductDetails,
   fetchProductHistory,
@@ -58,6 +59,7 @@ export default function ProductDecisionPage({ params }: PageProps) {
   // Effective price state
   const [effectiveData, setEffectiveData] = useState<any>(null);
   const [recalculating, setRecalculating] = useState(false);
+  const [refreshingTerms, setRefreshingTerms] = useState(false);
 
   // Exchange Arbitrage State
   const [newDevicePrice, setNewDevicePrice] = useState<number>(0);
@@ -69,7 +71,7 @@ export default function ProductDecisionPage({ params }: PageProps) {
     async function loadData() {
       setLoading(true);
       const [prod, hist] = await Promise.all([
-        fetchProductDetails(productId),
+        fetchProductDetails(productId, activeCardIds),
         fetchProductHistory(productId, historyDays),
       ]);
       setProduct(prod);
@@ -84,9 +86,19 @@ export default function ProductDecisionPage({ params }: PageProps) {
     loadData();
   }, [productId, historyDays]);
 
-  // Recalculate effective prices when cards or product changes
+  const handleRefreshLiveTerms = async () => {
+    setRefreshingTerms(true);
+    try {
+      const updated = await fetchProductDetails(productId, activeCardIds, true);
+      if (updated) setProduct(updated);
+    } finally {
+      setRefreshingTerms(false);
+    }
+  };
+
+  // Recalculate effective prices, Cash-vs-Points & store comparison whenever wallet cards change
   useEffect(() => {
-    if (!product || product.listings.length === 0) return;
+    if (!product || !product.listings || product.listings.length === 0) return;
     const cheapestListing = product.listings.reduce((prev, curr) =>
       (curr.current_listed_price || 999999) < (prev.current_listed_price || 999999) ? curr : prev
     );
@@ -94,18 +106,35 @@ export default function ProductDecisionPage({ params }: PageProps) {
     if (!cheapestListing.current_listed_price) return;
 
     setRecalculating(true);
-    recalculateEffectivePrice(
-      cheapestListing.current_listed_price,
-      activeCardIds,
-      cheapestListing.retailer,
-      0,
-      0,
-      cheapestListing.bank_offers || []
-    )
-      .then(setEffectiveData)
+    Promise.all([
+      recalculateEffectivePrice(
+        cheapestListing.current_listed_price,
+        activeCardIds,
+        cheapestListing.retailer,
+        0,
+        0,
+        cheapestListing.bank_offers || []
+      ),
+      fetchProductDetails(productId, activeCardIds),
+    ])
+      .then(([eff, refreshed]) => {
+        setEffectiveData(eff);
+        if (refreshed) {
+          setProduct((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  cash_vs_points: refreshed.cash_vs_points,
+                  ranked_store_choices: refreshed.ranked_store_choices,
+                  stacked_offers: refreshed.stacked_offers,
+                }
+              : prev
+          );
+        }
+      })
       .catch(console.warn)
       .finally(() => setRecalculating(false));
-  }, [product, activeCardIds]);
+  }, [activeCardIds, productId]);
 
   // Exchange comparison computation
   const handleExchangeCompare = async () => {
@@ -146,9 +175,19 @@ export default function ProductDecisionPage({ params }: PageProps) {
     );
   }
 
-  const cheapestListing = product.listings.reduce((prev, curr) =>
-    (curr.current_listed_price || 999999) < (prev.current_listed_price || 999999) ? curr : prev
-  );
+  const cheapestListing =
+    product.listings && product.listings.length > 0
+      ? product.listings.reduce((prev, curr) =>
+          (curr.current_listed_price || 999999) < (prev.current_listed_price || 999999) ? curr : prev
+        )
+      : {
+          retailer: "store",
+          listing_url: "",
+          listed_price: 0,
+          current_listed_price: 0,
+          current_mrp: null,
+          in_stock: false,
+        };
 
   const bestCard = effectiveData?.best_card;
   const missedSavings = effectiveData?.missed_savings;
@@ -272,6 +311,16 @@ export default function ProductDecisionPage({ params }: PageProps) {
 
       {/* ── Card Wallet Bar ── */}
       <CardWalletBar onCardsChanged={(ids) => setActiveCardIds(ids)} />
+
+      {/* ── Strict Cash-vs-Points Hero Split & Payment Strategy Matrix ── */}
+      {product.cash_vs_points && (
+        <CashVsPointsSection
+          report={product.cash_vs_points}
+          retailerLabel={retailerLabel(cheapestListing.retailer)}
+          refreshingTerms={refreshingTerms}
+          onRefreshLiveTerms={handleRefreshLiveTerms}
+        />
+      )}
 
       {/* ── Effective Price Hero Card ── */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
@@ -513,9 +562,10 @@ export default function ProductDecisionPage({ params }: PageProps) {
                 <tr className="border-b border-surface-border text-slate-400 uppercase text-[10px] tracking-wider">
                   <th className="py-3 px-4 font-bold">Store</th>
                   <th className="py-3 px-4 font-bold">Rank Badge</th>
-                  <th className="py-3 px-4 font-bold">Seller & Terms</th>
+                  <th className="py-3 px-4 font-bold">Seller &amp; Terms</th>
                   <th className="py-3 px-4 font-bold">Peace of Mind</th>
-                  <th className="py-3 px-4 font-bold">Effective Price</th>
+                  <th className="py-3 px-4 font-bold">Checkout Cash</th>
+                  <th className="py-3 px-4 font-bold">Your Card Net</th>
                   <th className="py-3 px-4 font-bold text-right">Store Link</th>
                 </tr>
               </thead>
@@ -523,9 +573,11 @@ export default function ProductDecisionPage({ params }: PageProps) {
                 {product.ranked_store_choices.map((r, idx) => {
                   const badgeColor = r.is_overall_winner
                     ? "bg-emerald-500/20 text-emerald-400 border-emerald-500/30"
-                    : r.rank_badge === "Lowest Net Price"
+                    : r.rank_badge.includes("Lowest Net Price")
                     ? "bg-indigo-500/20 text-indigo-400 border-indigo-500/30"
                     : "bg-amber-500/20 text-amber-400 border-amber-500/30";
+                  const cashPrice = r.checkout_cash_price ?? r.listed_price;
+                  const netPrice = r.best_user_card_net_price ?? r.effective_price;
                   return (
                     <tr
                       key={idx}
@@ -533,10 +585,15 @@ export default function ProductDecisionPage({ params }: PageProps) {
                         r.is_overall_winner ? "bg-emerald-500/5 font-semibold" : ""
                       }`}
                     >
-                      <td className="py-3.5 px-4 font-bold text-white flex items-center gap-2">
+                      <td className="py-3.5 px-4 font-bold text-white flex items-center gap-2 flex-wrap">
                         <span>{r.store_name}</span>
+                        {r.is_current_store && (
+                          <span className="text-[10px] px-1.5 py-0.5 rounded bg-indigo-500/20 text-indigo-300 font-extrabold border border-indigo-500/35">
+                            CURRENT PAGE
+                          </span>
+                        )}
                         {r.is_overall_winner && (
-                          <span className="text-[10px] px-1.5 py-0.2 rounded bg-emerald-500/20 text-emerald-400 font-extrabold border border-emerald-500/30">
+                          <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-400 font-extrabold border border-emerald-500/30">
                             WINNER
                           </span>
                         )}
@@ -555,8 +612,11 @@ export default function ProductDecisionPage({ params }: PageProps) {
                       <td className="py-3.5 px-4">
                         <span className="font-bold text-slate-200">{r.peace_of_mind_score}/100</span>
                       </td>
-                      <td className="py-3.5 px-4 font-black text-white text-sm">
-                        {formatINR(r.effective_price)}
+                      <td className="py-3.5 px-4 font-bold text-white text-sm font-mono">
+                        {formatINR(cashPrice)}
+                      </td>
+                      <td className="py-3.5 px-4 font-black text-emerald-400 text-sm font-mono">
+                        {formatINR(netPrice)}
                       </td>
                       <td className="py-3.5 px-4 text-right">
                         {r.url && (
