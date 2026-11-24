@@ -20,8 +20,12 @@ class Settings(BaseSettings):
     gemini_api_key: str = ""
     openrouter_api_key: str = ""
     openrouter_model: str = "google/gemini-2.5-flash"
+    llm_model: str = "google/gemini-2.5-flash"
     searxng_url: str = "http://localhost:8080"
     serper_api_key: str = ""
+    serp_mode: Literal["live", "replay"] = "live"
+    max_serper_credits_per_product: int = 3
+    max_llm_usd_per_run: float = 0.50
     default_pincode: str = "411001"
     quickcommerce_api_key: str = ""
     scrapingdog_api_key: str = ""

@@ -63,11 +63,16 @@ def _display_val(attr: Attr | None) -> str | None:
     return attr.norm or attr.raw
 
 
-def _compare_core_models(src_model: str, cand_model: str) -> Verdict:
+def _compare_core_models(
+    src_model: str,
+    cand_model: str,
+    attr_tokens: set[str] | None = None,
+) -> Verdict:
     """
     Compare `core_model` strings:
     - Normalize (casefold, strip punctuation/hyphens, token-order-insensitive).
     - Exact token-set & token-multiset equality -> MATCH.
+    - If token difference consists solely of tokens already captured in `attrs` (e.g. color/unit), -> MATCH.
     - If one side has extra/different tokens that change the model (e.g. "iPhone 15" vs "iPhone 15 Pro",
       or different alphanumeric model numbers like "K2" vs "K8", "15" vs "16"), return MISMATCH.
     - If fuzzy ratio >= 85.0 on minor orthographic variation without conflicting model numbers/tokens -> AMBIGUOUS.
@@ -83,6 +88,12 @@ def _compare_core_models(src_model: str, cand_model: str) -> Verdict:
 
     s_set = set(s_toks)
     c_set = set(c_toks)
+    if attr_tokens:
+        s_stripped = {t for t in s_set if t not in attr_tokens} or s_set
+        c_stripped = {t for t in c_set if t not in attr_tokens} or c_set
+        if s_stripped == c_stripped:
+            return Verdict.MATCH
+        s_set, c_set = s_stripped, c_stripped
 
     # Check alphanumeric/numeric model tokens: any difference in numeric tokens is a hard MISMATCH
     s_nums = {t for t in s_set if any(ch.isdigit() for ch in t)}
@@ -369,8 +380,16 @@ def decide(
     else:
         brand_verdict = Verdict.UNKNOWN
 
-    # Core model check
-    model_verdict = _compare_core_models(src.core_model, cand.core_model)
+    # Core model check (strip tokens already represented in explicit attributes)
+    shared_attr_tokens: set[str] = set()
+    for spec_o in (src, cand):
+        for a in spec_o.attrs.values():
+            for raw_s in (a.raw, a.norm):
+                if raw_s:
+                    for tok in re.split(r"[^a-z0-9]+", raw_s.casefold()):
+                        if len(tok) >= 2 and tok != "alpha":
+                            shared_attr_tokens.add(tok)
+    model_verdict = _compare_core_models(src.core_model, cand.core_model, attr_tokens=shared_attr_tokens)
 
     if gtin_equal:
         if brand_verdict == Verdict.MISMATCH or model_verdict == Verdict.MISMATCH:

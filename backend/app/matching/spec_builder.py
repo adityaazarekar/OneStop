@@ -430,8 +430,13 @@ def _extract_title_attributes_and_core_model(
     if detected_size_raw:
         core = re.sub(rf"\b{re.escape(detected_size_raw)}\b", " ", core, flags=re.I)
 
-    # Strip storage/RAM/quantity/pack expressions from core_model
-    core = re.sub(r"\b\d+(?:\.\d+)?\s*(?:TB|GB|MB|kg|g|gm|ml|l|ltr)\b(?:\s*(?:RAM|ROM|Storage|SSD))?", " ", core, flags=re.I)
+    # Strip storage/RAM/quantity/pack expressions from core_model (never strip cellular '4G' or '5G')
+    core = re.sub(
+        r"\b(?![45]G\b)\d+(?:\.\d+)?\s*(?:TB|GB|MB|kg|g|gm|ml|l|ltr)\b(?:\s*(?:RAM|ROM|Storage|SSD))?",
+        " ",
+        core,
+        flags=re.I,
+    )
     core = re.sub(r"\b(?:pack|set|combo)\s+of\s+\d+\b", " ", core, flags=re.I)
     core = re.sub(r"\b(?:refurbished|renewed|open\s+box|unboxed)\b", " ", core, flags=re.I)
     core = " ".join(core.split()).strip(" -–—,/|:")
