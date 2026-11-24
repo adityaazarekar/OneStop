@@ -439,6 +439,7 @@ def _extract_title_attributes_and_core_model(
     )
     core = re.sub(r"\b(?:pack|set|combo)\s+of\s+\d+\b", " ", core, flags=re.I)
     core = re.sub(r"\b(?:refurbished|renewed|open\s+box|unboxed)\b", " ", core, flags=re.I)
+    core = re.sub(r"\b(?:smartphone|mobile\s+phone|handset|buy\s+online|online\s+india)\b", " ", core, flags=re.I)
     core = " ".join(core.split()).strip(" -–—,/|:")
 
     if not core:

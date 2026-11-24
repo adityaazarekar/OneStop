@@ -1431,3 +1431,178 @@ async def compare_exchange(
         recommendation=comp.recommendation,
         reasoning=comp.reasoning,
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# M6: TWO-STAGE EXACT-VARIANT API, DECISION TRACES & WRONG-VARIANT FEEDBACK
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+@router.post("/matching/stage1")
+async def stage1_exact_variant_matching(
+    req: dict,
+    session: AsyncSession = Depends(get_db),
+):
+    """
+    M6 Stage 1 (<500ms warm, zero LLM):
+    Builds source `VariantSpec`, evaluates any candidate payloads deterministically via
+    `app.matching.comparator.decide`, persists `DecisionTrace` rows, and computes
+    `lowest_verified_price` strictly over `EXACT` + `in_stock` + `listed_price > 0` listings.
+    """
+    from app.matching.comparator import decide
+    from app.matching.contracts import Bucket, Verdict
+    from app.matching.spec_builder import build_variant_spec
+    from app.models.matching import AttributeAlias, DecisionTrace
+    from app.schemas.extraction import (
+        Stage1CandidateDecision,
+        Stage1MatchingRequest,
+        Stage1MatchingResponse,
+    )
+
+    t0 = time.perf_counter()
+    parsed_req = Stage1MatchingRequest.model_validate(req)
+    src_payload = parsed_req.payload
+    src_spec = build_variant_spec(src_payload)
+
+    # Load human-reviewed attribute_aliases from DB (if any)
+    aliases_map: dict[str, str] = {}
+    try:
+        alias_rows = (await session.execute(select(AttributeAlias))).scalars().all()
+        for row in alias_rows:
+            aliases_map[row.alias_value.strip().lower()] = row.canonical_value.strip().lower()
+    except Exception:
+        pass
+
+    decisions_out: list[Stage1CandidateDecision] = []
+    verified_prices: list[tuple[float, str]] = []
+
+    if src_payload.in_stock and src_payload.listed_price and src_payload.listed_price > 0:
+        verified_prices.append((float(src_payload.listed_price), src_payload.retailer))
+
+    for cand_p in parsed_req.candidates:
+        cand_spec = build_variant_spec(cand_p)
+        dec = decide(src_spec, cand_spec, aliases=aliases_map or None)
+
+        badges: list[str] = []
+        for d in dec.diffs:
+            if d.verdict == Verdict.MISMATCH:
+                badges.append(f"{d.name}: {d.cand_value or 'differs'}")
+            elif d.verdict == Verdict.UNKNOWN:
+                badges.append(f"couldn't confirm: {d.name}")
+
+        trace_id_str: str | None = None
+        try:
+            trace = DecisionTrace(
+                id=uuid.uuid4(),
+                source_spec_json=src_spec.model_dump(mode="json"),
+                cand_spec_json=cand_spec.model_dump(mode="json"),
+                decision_json=dec.model_dump(mode="json"),
+                versions={"comparator": "v2.0", "normalizer": "v2.0"},
+            )
+            session.add(trace)
+            trace_id_str = str(trace.id)
+        except Exception as exc:
+            logger.debug("DecisionTrace persistence skipped: %s", exc)
+
+        if dec.bucket == Bucket.EXACT and cand_p.in_stock and cand_p.listed_price and cand_p.listed_price > 0:
+            verified_prices.append((float(cand_p.listed_price), cand_p.retailer))
+
+        decisions_out.append(
+            Stage1CandidateDecision(
+                retailer=cand_p.retailer,
+                url=cand_p.url,
+                title=cand_p.title,
+                listed_price=cand_p.listed_price,
+                in_stock=cand_p.in_stock,
+                bucket=dec.bucket.value,  # type: ignore[arg-type]
+                variant_diff_badges=badges,
+                reasons=dec.reasons,
+                confidence=dec.confidence,
+                unit_price_cand=float(dec.unit_price_cand) if dec.unit_price_cand is not None else None,
+                unit_price_unit=dec.unit_price_unit,
+                trace_id=trace_id_str,
+            )
+        )
+
+    try:
+        await session.commit()
+    except Exception:
+        await session.rollback()
+
+    lowest_price: float | None = None
+    lowest_store: str | None = None
+    if verified_prices:
+        verified_prices.sort(key=lambda x: x[0])
+        lowest_price, lowest_store = verified_prices[0]
+
+    elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+    return Stage1MatchingResponse(
+        source_spec=src_spec.model_dump(mode="json"),
+        listed_price=float(src_payload.listed_price or 0.0),
+        stage1_latency_ms=elapsed_ms,
+        decisions=decisions_out,
+        lowest_verified_price=lowest_price,
+        lowest_verified_store=lowest_store,
+    )
+
+
+@router.post("/matching/feedback")
+async def submit_wrong_variant_feedback(
+    req: dict,
+    session: AsyncSession = Depends(get_db),
+):
+    """
+    M6 "Wrong variant?" Feedback Endpoint -> `review_queue` table.
+    Allows users/evaluators to flag a candidate pair for human review or alias addition.
+    """
+    from app.models.matching import ReviewQueueItem
+    from app.schemas.extraction import VariantFeedbackRequest, VariantFeedbackResponse
+
+    parsed = VariantFeedbackRequest.model_validate(req)
+    trace_uuid: uuid.UUID | None = None
+    if parsed.decision_trace_id:
+        try:
+            trace_uuid = uuid.UUID(parsed.decision_trace_id)
+        except ValueError:
+            trace_uuid = None
+
+    item = ReviewQueueItem(
+        id=uuid.uuid4(),
+        decision_trace_id=trace_uuid,
+        source_url=parsed.source_url[:1000],
+        cand_url=parsed.cand_url[:1000],
+        reported_issue=parsed.reported_issue or "wrong_variant",
+        source_spec_json=parsed.source_spec_json,
+        cand_spec_json=parsed.cand_spec_json,
+        status="pending",
+    )
+    session.add(item)
+    await session.commit()
+    return VariantFeedbackResponse(
+        review_queue_id=str(item.id),
+        status=item.status,
+        message="Queued for human variant review",
+    )
+
+
+@router.get("/matching/traces")
+async def list_decision_traces(
+    limit: int = Query(default=20, ge=1, le=100),
+    session: AsyncSession = Depends(get_db),
+):
+    """List recent pair-level matching `decision_traces`."""
+    from app.models.matching import DecisionTrace
+
+    stmt = select(DecisionTrace).order_by(DecisionTrace.ts.desc()).limit(limit)
+    rows = (await session.execute(stmt)).scalars().all()
+    return [
+        {
+            "id": str(r.id),
+            "source_spec_json": r.source_spec_json,
+            "cand_spec_json": r.cand_spec_json,
+            "decision_json": r.decision_json,
+            "versions": r.versions,
+            "ts": str(r.ts),
+        }
+        for r in rows
+    ]

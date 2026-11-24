@@ -293,8 +293,13 @@ def rank_stores_fairly(
     if not stores:
         return []
 
-    # ── Winner Guardrail: ONLY in_stock stores in exact_match or confirmed-variant lesser_known_store can win ──
-    eligible_winners = [
+    # ── Winner Guardrail: ONLY in_stock stores in exact_match (or confirmed lesser_known_store) with price > 0 can win ──
+    exact_verified_winners = [
+        s
+        for s in stores
+        if s.in_stock and s.store_bucket == "exact_match" and s.best_user_card_net_price > 0
+    ]
+    eligible_winners = exact_verified_winners or [
         s
         for s in stores
         if s.in_stock and s.store_bucket in ("exact_match", "lesser_known_store") and s.best_user_card_net_price > 0
@@ -309,9 +314,11 @@ def rank_stores_fairly(
         else:
             price_score = 0.0
         base_overall = round((price_score * 0.55) + (s.peace_of_mind_score * 0.30) + 15.0, 1)
-        # Penalize variant_mismatch and out_of_stock so they never rank above confirmed in-stock exact matches
+        # Penalize variant_mismatch, unverified, and out_of_stock so they never rank above confirmed in-stock exact matches
         if s.store_bucket == "variant_mismatch":
             base_overall = round(max(1.0, base_overall - 50.0), 1)
+        elif s.store_bucket == "unverified":
+            base_overall = round(max(1.0, base_overall - 40.0), 1)
         elif not s.in_stock:
             base_overall = round(max(1.0, base_overall - 35.0), 1)
         s.overall_score = base_overall

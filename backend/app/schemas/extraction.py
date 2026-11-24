@@ -136,9 +136,11 @@ class CompetitorQuote(BaseModel):
     extraction_tier: str | None = None
     image_url: str | None = None
     source: str | None = None  # "extension_offscreen" | "searxng" | "serper"
-    store_bucket: Literal["exact_match", "lesser_known_store", "variant_mismatch"] = "exact_match"
+    store_bucket: Literal["exact_match", "unverified", "lesser_known_store", "variant_mismatch"] = "exact_match"
     variant_diff_badges: list[str] = Field(default_factory=list)
     eta_label: str | None = None
+    unit_price_label: str | None = None
+    match_reasons: list[str] = Field(default_factory=list)
 
 
 class QuickCommerceQuote(BaseModel):
@@ -440,9 +442,11 @@ class StoreRankingChoice(BaseModel):
     overall_score: float = 0.0
     rank_badge: str = ""  # "Lowest Net Price", "Official & Peace of Mind", "Overall Best Choice"
     is_overall_winner: bool = False
-    store_bucket: Literal["exact_match", "lesser_known_store", "variant_mismatch"] = "exact_match"
+    store_bucket: Literal["exact_match", "unverified", "lesser_known_store", "variant_mismatch"] = "exact_match"
     variant_diff_badges: list[str] = Field(default_factory=list)
     eta_label: str = "2-4 days"
+    unit_price_label: str | None = None
+    match_reasons: list[str] = Field(default_factory=list)
 
 
 # ───────────────────────────────────────────
@@ -629,4 +633,48 @@ class VaultItemResponse(BaseModel):
     warranty_months: int
     warranty_expiry_date: str
     days_remaining: int
+
+
+class VariantFeedbackRequest(BaseModel):
+    decision_trace_id: str | None = None
+    source_url: str
+    cand_url: str
+    reported_issue: str = "wrong_variant"
+    source_spec_json: dict | None = None
+    cand_spec_json: dict | None = None
+
+
+class VariantFeedbackResponse(BaseModel):
+    review_queue_id: str
+    status: str = "pending"
+    message: str = "Queued for human variant review"
+
+
+class Stage1MatchingRequest(BaseModel):
+    payload: ClientPayload
+    candidates: list[ClientPayload] = Field(default_factory=list)
+
+
+class Stage1CandidateDecision(BaseModel):
+    retailer: str
+    url: str
+    title: str
+    listed_price: float | None = None
+    in_stock: bool = True
+    bucket: Literal["exact_match", "unverified", "variant_mismatch", "rejected"]
+    variant_diff_badges: list[str] = Field(default_factory=list)
+    reasons: list[str] = Field(default_factory=list)
+    confidence: float = 1.0
+    unit_price_cand: float | None = None
+    unit_price_unit: str | None = None
+    trace_id: str | None = None
+
+
+class Stage1MatchingResponse(BaseModel):
+    source_spec: dict
+    listed_price: float
+    stage1_latency_ms: float
+    decisions: list[Stage1CandidateDecision] = Field(default_factory=list)
+    lowest_verified_price: float | None = None
+    lowest_verified_store: str | None = None
 
