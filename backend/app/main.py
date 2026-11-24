@@ -28,6 +28,10 @@ _app_logger.propagate = False
 @asynccontextmanager
 async def lifespan(app: FastAPI):  # noqa: ARG001
     """Startup / shutdown hooks."""
+    if settings.env == "production" and settings.app_secret_key == "change-me-in-production":
+        raise RuntimeError(
+            "APP_SECRET_KEY must be changed from 'change-me-in-production' when ENV=production"
+        )
     # Preload OpenAI client & LLMParser singleton so first request pays 0ms import overhead
     try:
         import openai  # noqa: F401

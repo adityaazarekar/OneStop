@@ -295,3 +295,21 @@ async def test_price_observation_1h_dedupe_and_pipeline_query_budget():
         await _run_analysis_pipeline(payload, s_changed)
         assert any(isinstance(o, PriceObservation) for o in added_changed)
         assert s_changed.execute.await_count <= 4
+
+
+@pytest.mark.asyncio
+async def test_production_guard_rejects_default_app_secret_key():
+    from app.main import app, lifespan
+
+    orig_env = settings.env
+    orig_secret = settings.app_secret_key
+    try:
+        settings.env = "production"
+        settings.app_secret_key = "change-me-in-production"
+        with pytest.raises(RuntimeError, match="APP_SECRET_KEY"):
+            async with lifespan(app):
+                pass
+    finally:
+        settings.env = orig_env
+        settings.app_secret_key = orig_secret
+
