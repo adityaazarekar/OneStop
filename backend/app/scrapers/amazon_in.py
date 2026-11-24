@@ -285,6 +285,44 @@ class AmazonInScraper(BaseScraper):
 
     def _extract_specs(self, tree) -> dict:
         specs: dict = {}
+        selected_attrs: dict = {}
+
+        for sel in (
+            "#inline-twister-expanded-dimension-text-color_name",
+            "#variation_color_name .selection",
+            "tr.po-color td.a-span9 span",
+        ):
+            el = tree.css_first(sel)
+            if el:
+                val = el.text(strip=True)
+                if val and val.lower() not in ("select", "select color", "select colour"):
+                    specs["color"] = val
+                    selected_attrs["color"] = {"value": val, "source": "dom_selected", "span": val}
+                    break
+
+        for sel in (
+            "#inline-twister-expanded-dimension-text-size_name",
+            "#variation_size_name .selection",
+            "select#native_dropdown_selected_size_name option[selected]",
+            "tr.po-memory_storage_capacity td.a-span9 span",
+            "tr.po-size td.a-span9 span",
+        ):
+            el = tree.css_first(sel)
+            if el:
+                val = el.text(strip=True)
+                if val and val.lower() not in ("select", "select size"):
+                    stor_m = re.search(r"^(\d+)\s*(GB|TB)$", val, re.I)
+                    if stor_m:
+                        gb = int(stor_m.group(1)) * (1024 if stor_m.group(2).upper() == "TB" else 1)
+                        specs["storage_gb"] = gb
+                        selected_attrs["storage"] = {"value": val, "source": "dom_selected", "span": val}
+                    else:
+                        specs["size"] = val
+                        selected_attrs["size"] = {"value": val, "source": "dom_selected", "span": val}
+                    break
+                elif val and "select" in val.lower():
+                    selected_attrs["size"] = {"value": None, "source": "unknown", "span": val}
+
         for table in tree.css("#productDetails_techSpec_section_1, #productDetails_detailBullets_sections1"):
             for row in table.css("tr"):
                 cells = row.css("th, td")
@@ -298,8 +336,10 @@ class AmazonInScraper(BaseScraper):
             if ram_m:
                 specs["ram_gb"] = int(ram_m.group(1))
             storage_m = re.search(r"(\d+)\s*(?:GB|TB)\s*(?:ROM|Storage|SSD)", txt, re.I)
-            if storage_m:
+            if storage_m and "storage_gb" not in specs:
                 specs["storage_gb"] = int(storage_m.group(1))
+        if selected_attrs:
+            specs["selected_attrs"] = selected_attrs
         return specs
 
     # ── Cross-store search ──────────────────

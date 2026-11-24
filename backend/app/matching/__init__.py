@@ -14,6 +14,10 @@ from app.matching.contracts import (
     select_highest_precedence_attr,
     verify_llm_span,
 )
+from app.matching.spec_builder import (
+    build_variant_spec,
+    extract_selected_variant_from_html,
+)
 
 __all__ = [
     "Attr",
@@ -26,7 +30,9 @@ __all__ = [
     "Source",
     "VariantSpec",
     "Verdict",
+    "build_variant_spec",
     "decide",
+    "extract_selected_variant_from_html",
     "select_highest_precedence_attr",
     "verify_llm_span",
 ]

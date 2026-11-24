@@ -718,20 +718,37 @@ def parse_shopify_product_json(
         return None
 
     chosen: dict[str, Any] | None = None
+    selected_source = "hydration"
     hint_low = (preferred_variant_hint or "").lower()
     in_stock_variants = [v for v in variants if isinstance(v, dict) and v.get("available", True) is not False]
     pool = in_stock_variants or [v for v in variants if isinstance(v, dict)]
     if not pool:
         return None
 
-    if hint_low:
+    # 1. Exact URL ?variant=<id> parameter match (Source.URL_PARAM) — never guess cheapest when URL specifies variant!
+    m_var_id = re.search(r"[?&]variant=(\d+)", original_url or "")
+    if m_var_id:
+        target_vid = m_var_id.group(1)
+        for v in variants:
+            if isinstance(v, dict) and str(v.get("id")) == target_vid:
+                chosen = v
+                selected_source = "url_param"
+                break
+
+    # 2. Explicit preferred_variant_hint match
+    if chosen is None and hint_low:
         for v in pool:
             vtitle = str(v.get("title") or "").lower()
             if vtitle and vtitle != "default title" and vtitle in hint_low:
                 chosen = v
+                selected_source = "title_parse"
                 break
+
+    # 3. Single-variant product vs multi-variant unselected product
+    is_unselected_multivariant = False
     if chosen is None:
-        # Pick cheapest variant with valid positive price
+        if len(variants) > 1:
+            is_unselected_multivariant = True
         priced = [(parse_price_decimal(v.get("price")), v) for v in pool]
         priced = [(p, v) for p, v in priced if p is not None and p > 0]
         if not priced:
@@ -749,7 +766,12 @@ def parse_shopify_product_json(
     variant_title = str(chosen.get("title") or "").strip()
     full_title = (
         f"{title} ({variant_title})"
-        if variant_title and variant_title.lower() != "default title" and variant_title.lower() not in title.lower()
+        if (
+            not is_unselected_multivariant
+            and variant_title
+            and variant_title.lower() != "default title"
+            and variant_title.lower() not in title.lower()
+        )
         else title
     )
     retailer = detect_retailer_key(original_url)
@@ -759,6 +781,18 @@ def parse_shopify_product_json(
     seller = sanitize_seller_name(vendor, original_url, retailer) or "Official Direct Store"
     in_stock = bool(chosen.get("available", True))
     sku = str(chosen.get("sku") or chosen.get("id") or prod.get("id") or _extract_sku_from_url(original_url))[:64]
+
+    shopify_selected_attrs: dict[str, Any] = {}
+    options_meta = prod.get("options") if isinstance(prod.get("options"), list) else []
+    for idx, opt_obj in enumerate(options_meta[:3], start=1):
+        opt_name = str((opt_obj.get("name") if isinstance(opt_obj, dict) else opt_obj) or f"option{idx}").strip().lower()
+        opt_val = chosen.get(f"option{idx}")
+        if opt_name in ("color", "colour", "size", "storage", "capacity"):
+            canon_key = "color" if opt_name in ("color", "colour") else ("storage" if opt_name in ("storage", "capacity") else "size")
+            if is_unselected_multivariant:
+                shopify_selected_attrs[canon_key] = {"value": None, "source": "unknown", "span": None}
+            elif opt_val:
+                shopify_selected_attrs[canon_key] = {"value": str(opt_val), "source": selected_source, "span": str(opt_val)}
 
     return ClientPayload(
         retailer=retailer,
@@ -771,9 +805,10 @@ def parse_shopify_product_json(
         in_stock=in_stock,
         seller_name=seller,
         variant_specs={
-            **extract_variant_specs_from_title(full_title),
+            **(extract_variant_specs_from_title(full_title) if not is_unselected_multivariant else {}),
             "extraction_tier": "tier0_shopify_json",
             "shopify_variant_id": chosen.get("id"),
+            "selected_attrs": shopify_selected_attrs,
         },
         source="server",
     )

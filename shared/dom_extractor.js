@@ -1198,6 +1198,152 @@
     };
   }
 
+  // ─── Selected Variant Capture (Source.DOM_SELECTED / URL_PARAM / HYDRATION) ───
+
+  function isUnselectedPlaceholder(val) {
+    if (!val) return true;
+    var s = String(val).replace(/\s+/g, " ").trim().toLowerCase();
+    return (
+      !s ||
+      s === "select" ||
+      s === "select size" ||
+      s === "select color" ||
+      s === "select colour" ||
+      s === "choose an option" ||
+      s === "none"
+    );
+  }
+
+  function extractSelectedVariantAttrs(retailer, title) {
+    var selected = {};
+    var specs = {};
+
+    // 1. URL query parameters (variant, pid, color, size)
+    var search = window.location.search || "";
+    var varMatch = search.match(/[?&]variant=(\d+)/i);
+    if (varMatch) specs.url_variant_id = varMatch[1];
+    var colorParam = search.match(/[?&](?:color|colour)=([^&]+)/i);
+    if (colorParam) {
+      var cpVal = decodeURIComponent(colorParam[1].replace(/\+/g, " ")).trim();
+      if (!isUnselectedPlaceholder(cpVal)) {
+        selected.color = { value: cpVal, source: "url_param", span: colorParam[0] };
+        specs.color = cpVal;
+      }
+    }
+    var sizeParam = search.match(/[?&]size=([^&]+)/i);
+    if (sizeParam) {
+      var spVal = decodeURIComponent(sizeParam[1].replace(/\+/g, " ")).trim();
+      if (!isUnselectedPlaceholder(spVal)) {
+        selected.size = { value: spVal, source: "url_param", span: sizeParam[0] };
+        specs.size = spVal;
+      }
+    }
+
+    // 2. Amazon DOM selected twister & product overview rows
+    if (retailer === "amazon_in") {
+      var azColor =
+        txt("#inline-twister-expanded-dimension-text-color_name") ||
+        txt("#variation_color_name .selection") ||
+        txt("tr.po-color td.a-span9 span");
+      if (azColor && !isUnselectedPlaceholder(azColor)) {
+        selected.color = { value: azColor, source: "dom_selected", span: azColor };
+        specs.color = azColor;
+      } else if (qs("#variation_color_name, #inline-twister-row-color_name") && !selected.color) {
+        selected.color = { value: null, source: "unknown", span: null };
+      }
+
+      var azSize =
+        txt("#inline-twister-expanded-dimension-text-size_name") ||
+        txt("#variation_size_name .selection") ||
+        txt("select#native_dropdown_selected_size_name option[selected]") ||
+        txt("tr.po-memory_storage_capacity td.a-span9 span") ||
+        txt("tr.po-size td.a-span9 span");
+      if (azSize && !isUnselectedPlaceholder(azSize)) {
+        var storM = azSize.match(/^(\d+)\s*(GB|TB)$/i);
+        if (storM) {
+          specs.storage_gb = parseInt(storM[1], 10) * (/tb/i.test(storM[2]) ? 1024 : 1);
+          selected.storage = { value: azSize, source: "dom_selected", span: azSize };
+        } else {
+          specs.size = azSize;
+          selected.size = { value: azSize, source: "dom_selected", span: azSize };
+        }
+      } else if (qs("#variation_size_name, select#native_dropdown_selected_size_name") && !selected.size && !selected.storage) {
+        selected.size = { value: null, source: "unknown", span: null };
+      }
+    }
+
+    // 3. Flipkart selected swatches & spec tables
+    if (retailer === "flipkart") {
+      qsa("a._1fGeJ5._2UVyXR, li[id*='swatch-'] a._2UVyXR, [data-testid*='swatch'][aria-selected='true']").forEach(function (el) {
+        var sv = (el.textContent || "").replace(/\s+/g, " ").trim();
+        if (!sv) return;
+        if (/\b(\d+)\s*(GB|TB)\b/i.test(sv)) {
+          var sm = sv.match(/(\d+)\s*(GB|TB)/i);
+          specs.storage_gb = parseInt(sm[1], 10) * (/tb/i.test(sm[2]) ? 1024 : 1);
+          selected.storage = { value: sv, source: "dom_selected", span: sv };
+        } else {
+          specs.color = sv;
+          selected.color = { value: sv, source: "dom_selected", span: sv };
+        }
+      });
+      qsa("table._14cfVK tr, div._3Rrcbo tr").forEach(function (row) {
+        var cells = row.querySelectorAll("td, th");
+        if (cells.length >= 2) {
+          var k = cells[0].textContent.replace(/\s+/g, " ").trim().toLowerCase();
+          var v = cells[1].textContent.replace(/\s+/g, " ").trim();
+          if (!v) return;
+          if ((k === "color" || k === "brand color") && !selected.color) {
+            specs.color = v;
+            selected.color = { value: v, source: "dom_selected", span: v };
+          } else if ((k === "internal storage" || k === "rom") && !selected.storage) {
+            selected.storage = { value: v, source: "dom_selected", span: v };
+          } else if (k === "ram" && !selected.ram) {
+            selected.ram = { value: v, source: "dom_selected", span: v };
+          }
+        }
+      });
+    }
+
+    // 4. Universal / Myntra / Ajio / Shopify selected size & color buttons
+    var selSizeBtn = qs(
+      ".size-buttons-size-button-selected, " +
+      "[data-testid*='size'][aria-selected='true'], " +
+      "[data-testid*='size'][aria-checked='true'], " +
+      ".swatch-element.selected[data-option='size'], " +
+      "button.selected[data-size]"
+    );
+    if (selSizeBtn && !selected.size) {
+      var szVal = selSizeBtn.getAttribute("data-size") || selSizeBtn.textContent.replace(/\s+/g, " ").trim();
+      if (szVal && !isUnselectedPlaceholder(szVal)) {
+        specs.size = szVal;
+        selected.size = { value: szVal, source: "dom_selected", span: szVal };
+      }
+    } else if (qsa(".size-buttons-size-button, [data-testid*='size-btn']").length > 0 && !selected.size) {
+      selected.size = { value: null, source: "unknown", span: null };
+    }
+
+    var selColorBtn = qs(
+      "[data-testid*='color'][aria-selected='true'], " +
+      "[data-testid*='color'][aria-checked='true'], " +
+      ".swatch-element.selected[data-option='color'], " +
+      ".colour-listItem.selected, " +
+      "[data-selected-color]"
+    );
+    if (selColorBtn && !selected.color) {
+      var colVal =
+        selColorBtn.getAttribute("data-selected-color") ||
+        selColorBtn.getAttribute("title") ||
+        selColorBtn.textContent.replace(/\s+/g, " ").trim();
+      if (colVal && !isUnselectedPlaceholder(colVal)) {
+        specs.color = colVal;
+        selected.color = { value: colVal, source: "dom_selected", span: colVal };
+      }
+    }
+
+    specs.selected_attrs = selected;
+    return specs;
+  }
+
   // ─── Reusable Entry Point ────────────────
 
   function extractDOM() {
@@ -1217,6 +1363,14 @@
     } else {
       data = extractUniversal(retailer);
     }
+
+    data.variant_specs = data.variant_specs || {};
+    var selSpecs = extractSelectedVariantAttrs(retailer, data.title);
+    Object.keys(selSpecs).forEach(function (k) {
+      if (selSpecs[k] !== undefined) {
+        data.variant_specs[k] = selSpecs[k];
+      }
+    });
 
     var ogImg = metaContent("og:image");
     if (ogImg && !data.image_url) {

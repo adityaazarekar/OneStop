@@ -1,0 +1,33 @@
+{
+  "product": {
+    "id": 9001,
+    "title": "Keychron K2 Wireless Mechanical Keyboard",
+    "vendor": "Keychron",
+    "options": [
+      {"name": "Color", "position": 1, "values": ["Black", "White"]},
+      {"name": "Size", "position": 2, "values": ["M", "L"]}
+    ],
+    "variants": [
+      {
+        "id": 401,
+        "title": "Black / M",
+        "option1": "Black",
+        "option2": "M",
+        "price": "8499.00",
+        "compare_at_price": "9999.00",
+        "sku": "K2-BLK-M",
+        "available": true
+      },
+      {
+        "id": 402,
+        "title": "White / L",
+        "option1": "White",
+        "option2": "L",
+        "price": "9499.00",
+        "compare_at_price": "10999.00",
+        "sku": "K2-WHT-L",
+        "available": true
+      }
+    ]
+  }
+}

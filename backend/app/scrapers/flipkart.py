@@ -491,7 +491,17 @@ class FlipkartScraper(BaseScraper):
 
     def _extract_specs_fast(self, title: str, tree=None) -> dict:
         specs: dict = {}
+        selected_attrs: dict = {}
         if tree is not None:
+            for swatch in tree.css("a._1fGeJ5._2UVyXR, li[id*='swatch-'] a._2UVyXR"):
+                s_val = swatch.text(strip=True)
+                if not s_val:
+                    continue
+                if re.search(r"\b\d+\s*(?:GB|TB)\b", s_val, re.I):
+                    selected_attrs["storage"] = {"value": s_val, "source": "dom_selected", "span": s_val}
+                else:
+                    selected_attrs["color"] = {"value": s_val, "source": "dom_selected", "span": s_val}
+
             for table in tree.css("table._14cfVK, div._3Rrcbo"):
                 for row in table.css("tr"):
                     cells = row.css("td")
@@ -499,15 +509,29 @@ class FlipkartScraper(BaseScraper):
                         key = cells[0].text(strip=True).lower().replace(" ", "_")
                         val = cells[1].text(strip=True)
                         specs[key] = val
+                        if key in ("color", "brand_color") and val:
+                            specs.setdefault("color", val)
+                            selected_attrs.setdefault("color", {"value": val, "source": "dom_selected", "span": val})
+        # Extract parenthetical variant tokens from Flipkart title e.g. "Apple iPhone 15 (Black, 128 GB)"
+        paren_m = re.search(r"\(([^)]+)\)", title)
+        if paren_m:
+            for part in [p.strip() for p in paren_m.group(1).split(",") if p.strip()]:
+                if not re.search(r"\d", part) and len(part) >= 3:
+                    specs.setdefault("color", part)
+                    selected_attrs.setdefault("color", {"value": part, "source": "title_parse", "span": part})
         ram_m = re.search(r"(\d+)\s*GB\s*RAM", title, re.I)
         if ram_m:
             specs.setdefault("ram_gb", int(ram_m.group(1)))
-        storage_m = re.search(r"(\d+)\s*(?:GB|TB)\b", title, re.I)
+        title_no_ram = re.sub(r"\b\d+\s*GB\s*RAM\b", "", title, flags=re.I)
+        storage_m = re.search(r"(\d+)\s*(?:GB|TB)\b", title_no_ram, re.I)
         if storage_m:
             val = int(storage_m.group(1))
             if "tb" in storage_m.group(0).lower():
                 val *= 1024
             specs.setdefault("storage_gb", val)
+            selected_attrs.setdefault("storage", {"value": storage_m.group(0), "source": "title_parse", "span": storage_m.group(0)})
+        if selected_attrs:
+            specs["selected_attrs"] = selected_attrs
         return specs
 
     @staticmethod
