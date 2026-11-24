@@ -11,8 +11,8 @@ _BACKEND_DIR = Path(__file__).resolve().parent.parent
 
 
 class Settings(BaseSettings):
-    database_url: str = "postgresql+asyncpg://onestop:onestop_dev@localhost:5432/onestop"
-    database_url_sync: str = "postgresql+psycopg2://onestop:onestop_dev@localhost:5432/onestop"
+    database_url: str = "postgresql+asyncpg://onestop:onestop_dev@localhost:5433/onestop"
+    database_url_sync: str = "postgresql+psycopg2://onestop:onestop_dev@localhost:5433/onestop"
     redis_url: str = "redis://localhost:6379/0"
     scraper_mode: Literal["live", "mock"] = "live"
     gemini_api_key: str = ""
