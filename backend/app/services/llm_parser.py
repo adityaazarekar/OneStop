@@ -33,6 +33,19 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T", bound=BaseModel)
 
 CACHE_TTL_SECONDS = 7 * 24 * 60 * 60  # 7 days
+LLM_CALL_TIMEOUT_SECONDS = 4.0
+
+# Tracks runtime LLM availability: None (untested), "ok", or "degraded"
+_llm_health_state: str | None = None
+
+
+def get_llm_status() -> str:
+    """Return 'no_key', 'ok', or 'degraded' for /health reporting."""
+    if not settings.openrouter_api_key:
+        return "no_key"
+    if _llm_health_state == "degraded":
+        return "degraded"
+    return "ok"
 
 _CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*\n?", re.M)
 _CODE_FENCE_END_RE = re.compile(r"\n?```\s*$", re.M)
@@ -289,6 +302,32 @@ def _deterministic_reviews(reviews: list[str]) -> ReviewScamSignals:
     )
 
 
+def _deterministic_invoice(invoice_text: str) -> InvoiceExtracted:
+    """Regex fallback for tax invoice parsing when OpenRouter is unavailable/slow."""
+    from datetime import date
+
+    text = invoice_text or ""
+    prod_m = re.search(r"(?:Product|Description|Item)\s*[:\-]\s*(.+)", text, re.I)
+    price_m = re.search(r"(?:Grand\s*Total|Total\s*Amount|Total|Amount\s*Paid|Price)\s*[:\-]?\s*(?:₹|Rs\.?|INR)?\s*([\d,]+(?:\.\d+)?)", text, re.I)
+    inv_m = re.search(r"(?:Invoice\s*(?:No|Number|#)|Bill\s*No)\s*[:\-]?\s*([A-Za-z0-9\-/]+)", text, re.I)
+    date_m = re.search(r"(\d{4}-\d{2}-\d{2})", text)
+    seller_m = re.search(r"(?:Sold\s*By|Seller)\s*[:\-]\s*(.+)", text, re.I)
+
+    low = text.lower()
+    retailer = "amazon_in" if "amazon" in low else ("flipkart" if "flipkart" in low else ("croma" if "croma" in low else None))
+    price_val = float(price_m.group(1).replace(",", "")) if price_m else 0.0
+
+    return InvoiceExtracted(
+        product_name=(prod_m.group(1).strip()[:120] if prod_m else (text.strip().splitlines()[0][:120] if text.strip() else "Purchased Product")),
+        purchase_date=date_m.group(1) if date_m else date.today().isoformat(),
+        price_paid=price_val,
+        seller_name=(seller_m.group(1).strip()[:100] if seller_m else "Retailer"),
+        invoice_number=(inv_m.group(1).strip()[:60] if inv_m else f"INV-{abs(hash(text)) % 100000}"),
+        retailer=retailer,
+        warranty_months=12,
+    )
+
+
 class LLMParserError(Exception):
     """Raised when LLM parsing fails."""
 
@@ -310,7 +349,7 @@ class LLMParser:
         return AsyncOpenAI(
             base_url="https://openrouter.ai/api/v1",
             api_key=settings.openrouter_api_key,
-            timeout=6.0,  # 6-second hard limit on any OpenRouter HTTP call
+            timeout=LLM_CALL_TIMEOUT_SECONDS,  # 4-second hard limit on any OpenRouter HTTP call
         )
 
     # ── Cache ────────────────────────────────
@@ -320,7 +359,12 @@ class LLMParser:
         return f"{prefix}:{hashlib.sha256(text.encode()).hexdigest()}"
 
     async def _get_cached(self, key: str, schema: type[T]) -> T | None:
-        raw = await self._redis.get(key)
+        if self._redis is None:
+            return None
+        try:
+            raw = await self._redis.get(key)
+        except Exception:
+            return None
         if raw is None:
             return None
         try:
@@ -329,11 +373,17 @@ class LLMParser:
             return None
 
     async def _set_cache(self, key: str, obj: BaseModel) -> None:
-        await self._redis.set(key, obj.model_dump_json(), ex=CACHE_TTL_SECONDS)
+        if self._redis is None:
+            return
+        try:
+            await self._redis.set(key, obj.model_dump_json(), ex=CACHE_TTL_SECONDS)
+        except Exception:
+            pass
 
     # ── Core LLM call ───────────────────────
 
-    async def _call(self, prompt: str, schema: type[T], timeout: float = 6.0) -> T:
+    async def _call(self, prompt: str, schema: type[T], timeout: float = LLM_CALL_TIMEOUT_SECONDS) -> T:
+        global _llm_health_state
         if self._client is None:
             raise LLMParserError(
                 "OPENROUTER_API_KEY not configured. Set it in .env"
@@ -350,25 +400,33 @@ class LLMParser:
                         {"role": "user", "content": prompt},
                     ],
                     temperature=0.1,
+                    max_tokens=1024,
                 ),
                 timeout=timeout,
             )
         except asyncio.TimeoutError as exc:
+            _llm_health_state = "degraded"
             raise LLMParserError(f"OpenRouter LLM call timed out after {timeout}s") from exc
         except Exception as exc:
+            _llm_health_state = "degraded"
             raise LLMParserError(f"OpenRouter LLM call failed: {exc}") from exc
 
         raw = resp.choices[0].message.content or ""
         raw = _strip_code_fences(raw)
         try:
-            return schema.model_validate_json(raw)
+            parsed = schema.model_validate_json(raw)
+            _llm_health_state = "ok"
+            return parsed
         except Exception as exc:
             m = re.search(r"\{.*\}", raw, re.S)
             if m:
                 try:
-                    return schema.model_validate_json(m.group(0))
+                    parsed = schema.model_validate_json(m.group(0))
+                    _llm_health_state = "ok"
+                    return parsed
                 except Exception:
                     pass
+            _llm_health_state = "degraded"
             raise LLMParserError(f"Unparseable LLM response: {raw[:300]}") from exc
 
     # ── 1. Bank Offers ───────────────────────
@@ -392,10 +450,12 @@ class LLMParser:
         key = self._hash(combined, "offer_rule")
         cached = await self._get_cached(key, BankOfferRuleList)
         if cached:
+            logger.info("parse_bank_offers: llm_mode=llm cache_hit=true count=%d", len(cached.offers))
             return cached.offers
 
         fallback = _deterministic_bank_offers(cleaned_texts)
         if not settings.openrouter_api_key or self._client is None:
+            logger.info("parse_bank_offers: llm_mode=fallback reason=no_key count=%d", len(fallback))
             return fallback
 
         prompt = (
@@ -406,11 +466,12 @@ class LLMParser:
             "Raw texts:\n" + combined
         )
         try:
-            result = await self._call(prompt, BankOfferRuleList, timeout=12.0)
+            result = await self._call(prompt, BankOfferRuleList, timeout=LLM_CALL_TIMEOUT_SECONDS)
             await self._set_cache(key, result)
+            logger.info("parse_bank_offers: llm_mode=llm cache_hit=false count=%d", len(result.offers))
             return result.offers
         except Exception as exc:
-            logger.warning(f"LLM bank offer parse failed ({exc}) — using deterministic fallback")
+            logger.warning("parse_bank_offers: llm_mode=fallback reason=%s", exc)
             return fallback
 
     # ── 2. Variant Attributes ────────────────
@@ -420,10 +481,12 @@ class LLMParser:
         key = self._hash(input_text, "variant_attr")
         cached = await self._get_cached(key, VariantAttributes)
         if cached:
+            logger.info("parse_variant_attributes: llm_mode=llm cache_hit=true")
             return cached
 
         fallback = _deterministic_variant(title, specs_text)
         if not settings.openrouter_api_key or self._client is None:
+            logger.info("parse_variant_attributes: llm_mode=fallback reason=no_key")
             return fallback
 
         prompt = (
@@ -434,11 +497,12 @@ class LLMParser:
             + input_text
         )
         try:
-            result = await self._call(prompt, VariantAttributes, timeout=12.0)
+            result = await self._call(prompt, VariantAttributes, timeout=LLM_CALL_TIMEOUT_SECONDS)
             await self._set_cache(key, result)
+            logger.info("parse_variant_attributes: llm_mode=llm cache_hit=false")
             return result
         except Exception as exc:
-            logger.warning(f"LLM variant parse failed ({exc}) — using deterministic fallback")
+            logger.warning("parse_variant_attributes: llm_mode=fallback reason=%s", exc)
             return fallback
 
     # ── 3. Review Scam Analysis ──────────────
@@ -453,10 +517,12 @@ class LLMParser:
         key = self._hash(combined, "review_scam")
         cached = await self._get_cached(key, ReviewScamSignals)
         if cached:
+            logger.info("analyze_reviews: llm_mode=llm cache_hit=true")
             return cached
 
         fallback = _deterministic_reviews(bounded_reviews)
         if not settings.openrouter_api_key or self._client is None:
+            logger.info("analyze_reviews: llm_mode=fallback reason=no_key")
             return fallback
 
         prompt = (
@@ -468,11 +534,12 @@ class LLMParser:
             "Reviews:\n" + combined
         )
         try:
-            result = await self._call(prompt, ReviewScamSignals, timeout=12.0)
+            result = await self._call(prompt, ReviewScamSignals, timeout=LLM_CALL_TIMEOUT_SECONDS)
             await self._set_cache(key, result)
+            logger.info("analyze_reviews: llm_mode=llm cache_hit=false")
             return result
         except Exception as exc:
-            logger.warning(f"LLM review scam analysis failed ({exc}) — using deterministic fallback")
+            logger.warning("analyze_reviews: llm_mode=fallback reason=%s", exc)
             return fallback
 
     # ── 4. PDF Invoice ───────────────────────
@@ -481,7 +548,13 @@ class LLMParser:
         key = self._hash(invoice_text, "invoice")
         cached = await self._get_cached(key, InvoiceExtracted)
         if cached:
+            logger.info("parse_invoice: llm_mode=llm cache_hit=true")
             return cached
+
+        fallback = _deterministic_invoice(invoice_text)
+        if not settings.openrouter_api_key or self._client is None:
+            logger.info("parse_invoice: llm_mode=fallback reason=no_key")
+            return fallback
 
         prompt = (
             "Extract fields from this Indian e-commerce tax invoice.\n"
@@ -490,9 +563,14 @@ class LLMParser:
             "\"retailer\"(amazon_in/flipkart/croma/null),\"warranty_months\":int}\n\n"
             "Invoice:\n" + invoice_text[:5000]
         )
-        result = await self._call(prompt, InvoiceExtracted)
-        await self._set_cache(key, result)
-        return result
+        try:
+            result = await self._call(prompt, InvoiceExtracted, timeout=LLM_CALL_TIMEOUT_SECONDS)
+            await self._set_cache(key, result)
+            logger.info("parse_invoice: llm_mode=llm cache_hit=false")
+            return result
+        except Exception as exc:
+            logger.warning("parse_invoice: llm_mode=fallback reason=%s", exc)
+            return fallback
 
     # ── 5. Executive Recommendation Summary ─
 
@@ -519,6 +597,7 @@ class LLMParser:
         key = self._hash(cache_key_content, "exec_summary")
         cached = await self._get_cached(key, ExecutiveSummary)
         if cached:
+            logger.info("generate_executive_summary: llm_mode=llm cache_hit=true")
             return cached
 
         # Brutally Honest Deterministic Recommendation
@@ -557,6 +636,7 @@ class LLMParser:
         )
 
         if not settings.openrouter_api_key or self._client is None:
+            logger.info("generate_executive_summary: llm_mode=fallback reason=no_key")
             return fallback
 
         prompt = (
@@ -578,11 +658,12 @@ class LLMParser:
         )
 
         try:
-            result = await self._call(prompt, ExecutiveSummary)
+            result = await self._call(prompt, ExecutiveSummary, timeout=LLM_CALL_TIMEOUT_SECONDS)
             await self._set_cache(key, result)
+            logger.info("generate_executive_summary: llm_mode=llm cache_hit=false")
             return result
         except Exception as exc:
-            logger.warning(f"LLM executive summary generation failed ({exc}) — using deterministic fallback")
+            logger.warning("generate_executive_summary: llm_mode=fallback reason=%s", exc)
             return fallback
 
 

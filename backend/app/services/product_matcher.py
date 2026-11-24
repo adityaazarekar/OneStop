@@ -562,7 +562,9 @@ async def match_or_create(
     if model_name.lower().startswith("generic ") and brand.lower() != "unknown":
         model_name = model_name[8:].strip()
     model_name = model_name[:255]
-    mpn = None
+    mpn = (payload.variant_specs or {}).get("mpn") or (payload.variant_specs or {}).get("ean") or (payload.variant_specs or {}).get("gtin13")
+    if mpn:
+        mpn = str(mpn).strip()[:100] or None
     category = _guess_category(payload.title)[:50]
     retailer_clean = (payload.retailer or "generic")[:20]
     sku_clean = (payload.sku or "")[:100]
@@ -584,7 +586,7 @@ async def match_or_create(
     payload.seller_name = clean_seller
 
     # ── 0. Exact existing (retailer, external_sku) listing match — prevents orphan CanonicalProducts ──
-    if sku_clean and sku_clean not in ("UNKNOWN", "SKU-WEB"):
+    if sku_clean and sku_clean not in ("UNKNOWN", "UNKNOWN_FSN", "SKU-WEB"):
         exist_stmt = select(RetailerListing).where(
             RetailerListing.retailer == retailer_clean,
             RetailerListing.external_sku == sku_clean,
@@ -608,18 +610,19 @@ async def match_or_create(
             listing = await _upsert_listing(session, product, payload, 1.0)
             return product, listing, 1.0
 
-    # ── 2. pg_trgm similarity + RapidFuzz + variant spec check ──
+    # ── 2. pg_trgm GIN-indexed `%` similarity + RapidFuzz + variant spec check ──
     if model_name:
+        await session.execute(text(f"SET LOCAL pg_trgm.similarity_threshold = {SIMILARITY_THRESHOLD}"))
         rows = await session.execute(
             text("""
                 SELECT id, brand, model_name, mpn_or_ean, variant_specs, category,
                        similarity(model_name, :q) AS sim
                 FROM canonical_products
-                WHERE similarity(model_name, :q) > :threshold
+                WHERE model_name % :q
                 ORDER BY sim DESC
                 LIMIT 20
             """),
-            {"q": model_name, "threshold": SIMILARITY_THRESHOLD},
+            {"q": model_name},
         )
         for row in rows.mappings():
             existing_specs = row["variant_specs"] or {}

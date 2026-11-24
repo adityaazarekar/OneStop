@@ -7,9 +7,11 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import random
 import re
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
+from pathlib import Path
 from urllib.parse import urlparse
 
 import redis.asyncio as aioredis
@@ -22,6 +24,32 @@ from app.schemas.extraction import ClientPayload, ScraperResult, SearchHit
 logger = logging.getLogger(__name__)
 
 CACHE_TTL_SECONDS = 6 * 60 * 60  # 6 hours
+IMPERSONATION_PROFILES = ["chrome", "chrome124", "safari180", "edge101"]
+BLOCK_PAGE_MARKERS = (
+    "captcha",
+    "robot check",
+    "type the characters",
+    "enter the characters you see below",
+)
+_FIXTURES_DIR = Path(__file__).resolve().parent.parent.parent / "tests" / "fixtures"
+
+
+def is_block_page(html: str | None, retailer: str = "", url: str = "") -> bool:
+    """Detect Amazon/retailer soft-block or CAPTCHA pages even when HTTP status is 200."""
+    if not html:
+        return True
+    byte_len = len(html.encode("utf-8", errors="ignore"))
+    if byte_len < 20_000:
+        return True
+    if retailer == "amazon_in" and "/dp/" in (url or "") and "productTitle" not in html:
+        return True
+    # Only scan for captcha/bot-wall markers on small/medium pages (<120 KB) or in page <head>/top,
+    # so 1.5 MB+ JS bundles (e.g. Flipkart) mentioning "captcha" in client scripts do not false-trigger.
+    if byte_len < 120_000:
+        low = html.lower()
+        if any(marker in low for marker in BLOCK_PAGE_MARKERS):
+            return True
+    return False
 
 # ───────────────────────────────────────────
 # Error hierarchy
@@ -115,6 +143,12 @@ def parse_indian_price(text: str | None) -> float | None:
         return None
 
 
+async def _async_jitter(low: float = 0.3, high: float = 0.8) -> None:
+    import asyncio
+
+    await asyncio.sleep(random.uniform(low, high))
+
+
 def _cache_key(url: str) -> str:
     return f"page:{hashlib.sha256(url.encode()).hexdigest()}"
 
@@ -154,44 +188,98 @@ class BaseScraper(ABC):
 
     # ── Fetch pipeline ──────────────────────
 
-    async def fetch_page(self, url: str) -> str:
-        """Return HTML string for *url*, using cache → curl_cffi → Playwright."""
-        redis = await get_redis()
-        key = _cache_key(url)
+    def _load_mock_fixture(self) -> str:
+        """Load offline HTML fixture when SCRAPER_MODE=mock."""
+        candidates = [
+            _FIXTURES_DIR / f"{self.retailer}_product.html",
+            _FIXTURES_DIR / f"{self.retailer.replace('_in', '')}_product.html",
+            _FIXTURES_DIR / "generic_product.html",
+        ]
+        for path in candidates:
+            if path.is_file():
+                return path.read_text(encoding="utf-8", errors="ignore")
+        raise ScraperNetworkError(
+            f"SCRAPER_MODE=mock enabled but no fixture found for retailer '{self.retailer}' in {_FIXTURES_DIR}"
+        )
 
-        # 1. Cache hit
-        cached = await redis.get(key)
-        if cached:
-            logger.debug("Cache hit for %s", url)
-            return cached
-
-        # 2. curl_cffi
-        html: str | None = None
+    async def cache_page(self, url: str, html: str) -> None:
+        """Persist HTML in 6-hour Redis cache ONLY if it is not a block page."""
+        if not html or is_block_page(html, self.retailer, url):
+            return
         try:
-            html = await self._fetch_curl_cffi(url)
-        except ScraperBlockedError:
-            logger.warning("curl_cffi blocked for %s, trying Playwright", url)
+            redis = await get_redis()
+            await redis.set(_cache_key(url), html, ex=CACHE_TTL_SECONDS)
         except Exception as exc:
-            logger.warning("curl_cffi error for %s: %s", url, exc)
+            logger.debug("Redis cache set skipped for %s: %s", url, exc)
+
+    async def _warmup_session(self, session: AsyncSession) -> None:  # noqa: ARG002
+        """Optional per-retailer session warm-up hook (overridden by AmazonInScraper)."""
+        return None
+
+    async def fetch_page(self, url: str, *, auto_cache: bool = False) -> str:
+        """Return HTML string for *url*, using mock/cache → rotating curl_cffi → Playwright."""
+        if settings.scraper_mode == "mock":
+            return self._load_mock_fixture()
+
+        key = _cache_key(url)
+        try:
+            redis = await get_redis()
+            cached = await redis.get(key)
+            if cached and not is_block_page(cached, self.retailer, url):
+                logger.debug("Cache hit for %s", url)
+                return cached
+        except Exception as exc:
+            logger.debug("Redis cache get skipped for %s: %s", url, exc)
+
+        # 2. curl_cffi with up to 3 attempts rotating impersonation profiles on soft/hard blocks
+        html: str | None = None
+        last_err: Exception | None = None
+        profiles = IMPERSONATION_PROFILES[:3]
+        for attempt_idx, profile in enumerate(profiles):
+            if attempt_idx > 0:
+                await _async_jitter(0.3, 0.8)
+            try:
+                candidate = await self._fetch_curl_cffi(url, impersonate=profile)
+                if is_block_page(candidate, self.retailer, url):
+                    logger.warning(
+                        "Soft-block detected for %s (profile=%s, bytes=%d) — retrying",
+                        url,
+                        profile,
+                        len(candidate.encode("utf-8", errors="ignore")),
+                    )
+                    last_err = ScraperBlockedError(url, 200)
+                    continue
+                html = candidate
+                break
+            except ScraperBlockedError as exc:
+                logger.warning("curl_cffi blocked for %s (profile=%s, status=%s)", url, profile, exc.status)
+                last_err = exc
+            except Exception as exc:
+                logger.warning("curl_cffi error for %s (profile=%s): %s", url, profile, exc)
+                last_err = exc
 
         # 3. Playwright fallback
         if html is None:
             try:
-                html = await self._fetch_playwright(url)
+                candidate_pw = await self._fetch_playwright(url)
+                if is_block_page(candidate_pw, self.retailer, url):
+                    raise ScraperBlockedError(url, 200)
+                html = candidate_pw
             except Exception as exc:
-                raise ScraperBlockedError(url) from exc
+                raise ScraperBlockedError(url) from (exc or last_err)
 
-        # 4. Store in cache
-        await redis.set(key, html, ex=CACHE_TTL_SECONDS)
+        if auto_cache:
+            await self.cache_page(url, html)
         return html
 
-    async def _fetch_curl_cffi(self, url: str) -> str:
+    async def _fetch_curl_cffi(self, url: str, impersonate: str = "chrome") -> str:
         headers = {
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-IN,en;q=0.9,hi;q=0.8",
             "Accept-Encoding": "gzip, deflate, br",
         }
-        async with AsyncSession(impersonate="chrome") as session:
+        async with AsyncSession(impersonate=impersonate) as session:
+            await self._warmup_session(session)
             resp = await session.get(url, headers=headers, timeout=20)
             if resp.status_code in (403, 429, 503):
                 raise ScraperBlockedError(url, resp.status_code)

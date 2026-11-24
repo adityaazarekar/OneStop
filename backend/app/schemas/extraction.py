@@ -59,6 +59,7 @@ class ClientPayload(BaseModel):
     mrp: float | None = None
     retailer_advertised_lowest_price: float | None = None
     image_url: str | None = None
+    images: list[str] = Field(default_factory=list)
     pincode: str | None = None
     currency: str = "INR"
     in_stock: bool = True
@@ -78,6 +79,7 @@ class ClientPayload(BaseModel):
     variant_specs: dict = Field(default_factory=dict)
 
     @field_validator(
+        "images",
         "sellers",
         "raw_bank_offers",
         "raw_coupons",
@@ -208,6 +210,27 @@ class BankOfferRule(BaseModel):
     is_cashback: bool = False
     is_upto_ceiling: bool = False
     has_explicit_flat: bool = False
+
+    @field_validator(
+        "min_txn_amount",
+        "discount_flat",
+        "discount_pct",
+        "max_discount_cap",
+        mode="before",
+    )
+    @classmethod
+    def _coerce_null_float(cls, v):
+        return float(v) if v is not None else 0.0
+
+    @field_validator("excluded_cards", mode="before")
+    @classmethod
+    def _coerce_null_list(cls, v):
+        return v if v is not None else []
+
+    @field_validator("summary", mode="before")
+    @classmethod
+    def _coerce_null_str(cls, v):
+        return str(v) if v is not None else ""
 
 
 class BankOfferRuleList(BaseModel):

@@ -8,6 +8,7 @@ Processes uploaded PDF invoices:
 """
 from __future__ import annotations
 
+import io
 import uuid
 from datetime import date, timedelta
 
@@ -28,7 +29,7 @@ async def process_invoice(
     import pdfplumber
 
     text_parts: list[str] = []
-    with pdfplumber.open_from_bytes(file_bytes) as pdf:
+    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
         for page in pdf.pages:
             page_text = page.extract_text()
             if page_text:

@@ -728,14 +728,35 @@ async def analyze_url(
     card_ids: list[str] = Query(default=[]),
     session: AsyncSession = Depends(get_db),
 ):
-    """Server-side universal scrape for direct URL pastes on web dashboard (any site)."""
-    # Try 3-Tier universal Scrapling + extruct scraper first (handles short links + any store)
-    uni_payload, tier_info = await extract_from_url(url, allow_tier2=True)
+    """Server-side scrape for direct URL pastes: dedicated Amazon/Flipkart scrapers first, universal_scraper fallback/other stores."""
+    from app.scrapers.base_scraper import detect_retailer, resolve_url_redirects
+
+    canonical_url = await resolve_url_redirects(url)
+    retailer = detect_retailer(canonical_url)
+
+    # Dedicated scrapers first for Amazon.in and Flipkart
+    if retailer in ("amazon_in", "flipkart"):
+        scraper = get_scraper(canonical_url)
+        try:
+            result: ScraperResult = await scraper.scrape(canonical_url)
+            if result.success and result.payload is not None and result.payload.listed_price:
+                return await _run_analysis_pipeline(result.payload, session, card_ids or None)
+        except ScraperError as exc:
+            logger.warning("Dedicated %s scraper failed for %s (%s) — trying universal_scraper", retailer, canonical_url, exc)
+
+        uni_payload, tier_info = await extract_from_url(canonical_url, allow_tier2=True)
+        if uni_payload and uni_payload.listed_price and uni_payload.listed_price > 0:
+            return await _run_analysis_pipeline(uni_payload, session, card_ids or None)
+        raise HTTPException(
+            status_code=502,
+            detail=f"Live fetch failed ({tier_info}). Use Chrome Extension or App for ₹0 extraction.",
+        )
+
+    # All other domains: 4-tier universal scraper first, dedicated scraper fallback
+    uni_payload, tier_info = await extract_from_url(canonical_url, allow_tier2=True)
     if uni_payload and uni_payload.listed_price and uni_payload.listed_price > 0:
         return await _run_analysis_pipeline(uni_payload, session, card_ids or None)
 
-    from app.scrapers.base_scraper import resolve_url_redirects
-    canonical_url = await resolve_url_redirects(url)
     scraper = get_scraper(canonical_url)
     try:
         result: ScraperResult = await scraper.scrape(canonical_url)

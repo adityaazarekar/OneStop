@@ -6,6 +6,7 @@ import logging
 import re
 from urllib.parse import quote_plus
 
+from app.config import settings
 from app.schemas.extraction import ClientPayload, ScraperResult, SearchHit
 from app.scrapers.base_scraper import (
     BaseScraper,
@@ -19,16 +20,43 @@ logger = logging.getLogger(__name__)
 class AmazonInScraper(BaseScraper):
     retailer = "amazon_in"
 
+    async def _warmup_session(self, session) -> None:
+        """Hit Amazon.in homepage to acquire session cookies and apply default pincode via glow endpoint."""
+        headers = {
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-IN,en;q=0.9,hi;q=0.8",
+        }
+        try:
+            await session.get("https://www.amazon.in/", headers=headers, timeout=10)
+            pincode = getattr(settings, "default_pincode", "411001") or "411001"
+            await session.post(
+                "https://www.amazon.in/portal-migration/hz/glow/address-change?actionSource=glow",
+                json={
+                    "locationType": "LOCATION_INPUT",
+                    "zipCode": str(pincode),
+                    "storeContext": "generic",
+                    "deviceType": "web",
+                    "pageType": "Gateway",
+                    "actionSource": "glow",
+                },
+                headers={**headers, "X-Requested-With": "XMLHttpRequest", "Accept": "application/json"},
+                timeout=8,
+            )
+            logger.debug("Amazon warmup cookies collected: %s", list(session.cookies.keys()))
+        except Exception as exc:
+            logger.debug("Amazon warmup failed (continuing): %s", exc)
+
     # ── Single product extraction ──────────
 
     async def extract_product(self, url: str) -> ScraperResult:
         try:
-            html = await self.fetch_page(url)
+            html = await self.fetch_page(url, auto_cache=False)
         except Exception as exc:
             return ScraperResult(success=False, error=str(exc))
 
         try:
             payload = self._parse_product_page(html, url)
+            await self.cache_page(url, html)
             return ScraperResult(success=True, payload=payload, source="curl_cffi")
         except ScraperParseError as exc:
             return ScraperResult(success=False, error=str(exc))
@@ -108,6 +136,19 @@ class AmazonInScraper(BaseScraper):
         # ── Variant specs from detail tables ──
         variant_specs = self._extract_specs(soup)
 
+        # ── Images ──
+        images: list[str] = []
+        landing_img = soup.select_one("#landingImage, #imgBlkFront")
+        if landing_img:
+            dyn = landing_img.get("data-a-dynamic-image")
+            if dyn:
+                try:
+                    images = list(json.loads(dyn).keys())[:6]
+                except Exception:
+                    pass
+            if not images and landing_img.get("src"):
+                images = [landing_img["src"]]
+
         return ClientPayload(
             retailer="amazon_in",
             url=url,
@@ -116,6 +157,8 @@ class AmazonInScraper(BaseScraper):
             sku=asin,
             listed_price=listed_price,
             mrp=mrp,
+            image_url=images[0] if images else None,
+            images=images,
             in_stock=in_stock,
             seller_name=seller_name,
             seller_rating=seller_rating,
