@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import StreamingResponse
@@ -217,8 +218,14 @@ async def _run_analysis_pipeline(
     session: AsyncSession,
     user_card_ids: list[str] | None = None,
     competitor_quotes: list[CompetitorQuote] | None = None,
+    *,
+    endpoint_label: str = "/analyze-client-payload",
+    redirect_ms: float = 0.0,
+    fetch_ms: float = 0.0,
+    parse_ms: float = 0.0,
 ) -> AnalysisResponse:
     """Core pipeline: match → parse offers → optimize → forensics → buy/wait."""
+    t_pipe0 = time.perf_counter()
     from app.services.product_matcher import is_generic_or_invalid_listing
     is_invalid, reason = is_generic_or_invalid_listing(payload.title, payload.listed_price, payload.url)
     if is_invalid:
@@ -229,7 +236,8 @@ async def _run_analysis_pipeline(
 
     parser = await get_llm_parser()
 
-    # Concurrently parse variant, bank offers, and review signals (bounded with 12s timeout & deterministic fallbacks)
+    # Concurrently parse variant, bank offers, and review signals (bounded with 4s timeout & deterministic fallbacks)
+    t_llm0 = time.perf_counter()
     variant_task = parser.parse_variant_attributes(
         payload.title or "",
         str(payload.variant_specs or {}),
@@ -243,25 +251,58 @@ async def _run_analysis_pipeline(
     variant_res, offers_res, reviews_res = await asyncio.gather(
         variant_task, offers_task, reviews_task, return_exceptions=True
     )
+    llm_gather_ms = (time.perf_counter() - t_llm0) * 1000
     from app.schemas.extraction import VariantAttributes, ReviewScamSignals
     variant = variant_res if isinstance(variant_res, VariantAttributes) else None
     parsed_offers = offers_res if isinstance(offers_res, list) else []
     review_signals = reviews_res if isinstance(reviews_res, ReviewScamSignals) else None
 
     # 2. Match or create canonical product + listing
+    t_match0 = time.perf_counter()
     product, listing, confidence = await match_or_create(session, payload, variant)
+    match_ms = (time.perf_counter() - t_match0) * 1000
 
-    # 3. Record price observation
-    obs = PriceObservation(
-        observed_at=datetime.now(timezone.utc),
-        listing_id=listing.id,
-        listed_price=payload.listed_price or 0,
-        coupon_discount=0,
-        best_bank_discount=0,
-        in_stock=payload.in_stock,
-        source=payload.source,
-    )
-    session.add(obs)
+    # 3. Record price observation (deduped: only insert if price/stock changed or last obs > 1h old)
+    t_db0 = time.perf_counter()
+    now_utc = datetime.now(timezone.utc)
+    new_price = payload.listed_price or 0
+    should_insert_obs = True
+    if not getattr(listing, "_is_new", False):
+        try:
+            last_obs_stmt = (
+                select(
+                    PriceObservation.listed_price,
+                    PriceObservation.in_stock,
+                    PriceObservation.observed_at,
+                )
+                .where(PriceObservation.listing_id == listing.id)
+                .order_by(PriceObservation.observed_at.desc())
+                .limit(1)
+            )
+            last_obs_row = (await session.execute(last_obs_stmt)).first()
+            if last_obs_row is not None:
+                last_price, last_in_stock, last_ts = last_obs_row
+                if last_ts is not None and getattr(last_ts, "tzinfo", None) is None:
+                    last_ts = last_ts.replace(tzinfo=timezone.utc)
+                same_price = abs(float(last_price or 0) - float(new_price)) < 1e-6
+                same_stock = bool(last_in_stock) == bool(payload.in_stock)
+                within_1h = last_ts is not None and (now_utc - last_ts) < timedelta(hours=1)
+                if same_price and same_stock and within_1h:
+                    should_insert_obs = False
+        except Exception:
+            should_insert_obs = True
+
+    if should_insert_obs:
+        obs = PriceObservation(
+            observed_at=now_utc,
+            listing_id=listing.id,
+            listed_price=new_price,
+            coupon_discount=0,
+            best_bank_discount=0,
+            in_stock=payload.in_stock,
+            source=payload.source,
+        )
+        session.add(obs)
 
     # Persist parsed offers
     for po in parsed_offers:
@@ -287,21 +328,18 @@ async def _run_analysis_pipeline(
         )
         session.add(db_offer)
 
-    # 5. Load user cards STRICTLY from user_card_ids (never treat unowned cards as owned!)
-    parsed_user_uuids = _parse_valid_uuids(user_card_ids)
+    # 5. Single CreditCard query for both owned wallet & unowned/missed-savings comparisons
+    all_cards_result = await session.execute(select(CreditCard))
+    all_cards_db = list(all_cards_result.scalars().all())
+    all_cards = [_card_to_cardlike(c) for c in all_cards_db]
+    parsed_user_uuids = set(_parse_valid_uuids(user_card_ids))
     if parsed_user_uuids:
-        stmt = select(CreditCard).where(CreditCard.id.in_(parsed_user_uuids))
-        result = await session.execute(stmt)
-        cards_db = list(result.scalars().all())
-        user_cards = [_card_to_cardlike(c) for c in cards_db]
+        user_cards = [_card_to_cardlike(c) for c in all_cards_db if c.id in parsed_user_uuids]
     else:
         user_cards = []
-
-    # All cards for separate "Other Cards (Not in Your Wallet)" & missed-savings comparison
-    all_cards_result = await session.execute(select(CreditCard))
-    all_cards = [_card_to_cardlike(c) for c in all_cards_result.scalars().all()]
     owned_names_set = {c.card_name.lower() for c in user_cards}
     unowned_cards = [c for c in all_cards if c.card_name.lower() not in owned_names_set]
+    db_ms = (time.perf_counter() - t_db0) * 1000
 
     # 6. Card optimizer (strictly on user's owned cards)
     listed = payload.listed_price or 0.0
@@ -433,12 +471,10 @@ async def _run_analysis_pipeline(
             competitor_quotes, product, session, variant.model_dump() if variant else {},
         )
 
-    # Explicitly commit CanonicalProduct, RetailerListing, PriceObservation & refresh BEFORE returning canonical_product_id
+    # Explicitly commit CanonicalProduct, RetailerListing, PriceObservation BEFORE returning canonical_product_id
+    t_commit0 = time.perf_counter()
     await session.commit()
-    try:
-        await session.refresh(product)
-    except Exception:
-        pass
+    db_ms += (time.perf_counter() - t_commit0) * 1000
 
     # Build listings snapshot (filtering out any legacy blocked non-retailer rows)
     all_listings_stmt = (
@@ -563,6 +599,7 @@ async def _run_analysis_pipeline(
         else None
     )
 
+    t_sum0 = time.perf_counter()
     try:
         exec_summary = await parser.generate_executive_summary(
             product_title=prod_title,
@@ -591,6 +628,20 @@ async def _run_analysis_pipeline(
                 f"Price: Final effective price ₹{final_price:,.0f}.",
             ],
         )
+    llm_total_ms = llm_gather_ms + ((time.perf_counter() - t_sum0) * 1000)
+    pipe_total_ms = (time.perf_counter() - t_pipe0) * 1000
+    total_with_scrape_ms = redirect_ms + fetch_ms + parse_ms + pipe_total_ms
+    logger.info(
+        "PIPELINE_TIMING endpoint=%s redirect_ms=%.1f fetch_ms=%.1f parse_ms=%.1f match_ms=%.1f llm_ms=%.1f db_ms=%.1f total_ms=%.1f",
+        endpoint_label,
+        redirect_ms,
+        fetch_ms,
+        parse_ms,
+        match_ms,
+        llm_total_ms,
+        db_ms,
+        total_with_scrape_ms,
+    )
 
     qc_quotes: list[QuickCommerceQuote] = []
     qc_key = detect_qc_platform_key(payload.url) or detect_qc_platform_key(payload.retailer)
@@ -731,7 +782,9 @@ async def analyze_url(
     """Server-side scrape for direct URL pastes: dedicated Amazon/Flipkart scrapers first, universal_scraper fallback/other stores."""
     from app.scrapers.base_scraper import detect_retailer, resolve_url_redirects
 
+    t_redir0 = time.perf_counter()
     canonical_url = await resolve_url_redirects(url)
+    redirect_ms = (time.perf_counter() - t_redir0) * 1000
     retailer = detect_retailer(canonical_url)
 
     # Dedicated scrapers first for Amazon.in and Flipkart
@@ -740,22 +793,48 @@ async def analyze_url(
         try:
             result: ScraperResult = await scraper.scrape(canonical_url)
             if result.success and result.payload is not None and result.payload.listed_price:
-                return await _run_analysis_pipeline(result.payload, session, card_ids or None)
+                return await _run_analysis_pipeline(
+                    result.payload,
+                    session,
+                    card_ids or None,
+                    endpoint_label="/analyze-url",
+                    redirect_ms=redirect_ms,
+                    fetch_ms=result.fetch_ms,
+                    parse_ms=result.parse_ms,
+                )
         except ScraperError as exc:
             logger.warning("Dedicated %s scraper failed for %s (%s) — trying universal_scraper", retailer, canonical_url, exc)
 
+        t_u0 = time.perf_counter()
         uni_payload, tier_info = await extract_from_url(canonical_url, allow_tier2=True)
+        u_ms = (time.perf_counter() - t_u0) * 1000
         if uni_payload and uni_payload.listed_price and uni_payload.listed_price > 0:
-            return await _run_analysis_pipeline(uni_payload, session, card_ids or None)
+            return await _run_analysis_pipeline(
+                uni_payload,
+                session,
+                card_ids or None,
+                endpoint_label="/analyze-url",
+                redirect_ms=redirect_ms,
+                fetch_ms=u_ms,
+            )
         raise HTTPException(
             status_code=502,
             detail=f"Live fetch failed ({tier_info}). Use Chrome Extension or App for ₹0 extraction.",
         )
 
     # All other domains: 4-tier universal scraper first, dedicated scraper fallback
+    t_u0 = time.perf_counter()
     uni_payload, tier_info = await extract_from_url(canonical_url, allow_tier2=True)
+    u_ms = (time.perf_counter() - t_u0) * 1000
     if uni_payload and uni_payload.listed_price and uni_payload.listed_price > 0:
-        return await _run_analysis_pipeline(uni_payload, session, card_ids or None)
+        return await _run_analysis_pipeline(
+            uni_payload,
+            session,
+            card_ids or None,
+            endpoint_label="/analyze-url",
+            redirect_ms=redirect_ms,
+            fetch_ms=u_ms,
+        )
 
     scraper = get_scraper(canonical_url)
     try:
@@ -770,7 +849,15 @@ async def analyze_url(
             status_code=502,
             detail=result.error or f"Scraper returned no data ({tier_info}). Use Extension/App instead.",
         )
-    return await _run_analysis_pipeline(result.payload, session, card_ids or None)
+    return await _run_analysis_pipeline(
+        result.payload,
+        session,
+        card_ids or None,
+        endpoint_label="/analyze-url",
+        redirect_ms=redirect_ms,
+        fetch_ms=result.fetch_ms,
+        parse_ms=result.parse_ms,
+    )
 
 
 @router.post("/calculate-effective-price", response_model=EffectivePriceResponse)
@@ -828,6 +915,7 @@ async def list_recent_products(
 
     stmt = (
         select(CanonicalProduct)
+        .options(selectinload(CanonicalProduct.listings))
         .where(
             CanonicalProduct.id.in_(valid_subquery),
             CanonicalProduct.model_name != "",

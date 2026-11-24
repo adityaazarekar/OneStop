@@ -190,6 +190,11 @@ class VariantAttributes(BaseModel):
     processor: str | None = None
     condition: Literal["new", "refurbished", "open_box", "used"] = "new"
 
+    @field_validator("brand", "model_family", "model_name", mode="before")
+    @classmethod
+    def _coerce_null_str(cls, v: object) -> str:
+        return "" if v is None else str(v)
+
 
 class BankOfferRule(BaseModel):
     """Single parsed bank/card offer from raw T&C text."""
@@ -277,6 +282,8 @@ class ScraperResult(BaseModel):
         "curl_cffi", "playwright", "cache", "extension", "app"
     ] = "curl_cffi"
     cached: bool = False
+    fetch_ms: float = 0.0
+    parse_ms: float = 0.0
 
 
 class SearchHit(BaseModel):

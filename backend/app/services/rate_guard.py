@@ -80,13 +80,45 @@ def extract_domain(url: str) -> str:
 
 
 def get_domain_limiter(domain: str) -> AsyncLimiter:
-    """Return the per-domain AsyncLimiter (1 req / 2.5s)."""
+    """Return the per-domain AsyncLimiter (1 req / 2.0s)."""
     d = domain.lower().strip()
     limiter = _DOMAIN_LIMITERS.get(d)
     if limiter is None:
-        limiter = AsyncLimiter(max_rate=1, time_period=2.5)
+        limiter = AsyncLimiter(max_rate=1, time_period=2.0)
         _DOMAIN_LIMITERS[d] = limiter
     return limiter
+
+
+async def acquire_domain_rate_limit(
+    domain: str,
+    interval_seconds: float = 2.0,
+    redis_client: aioredis.Redis | None = None,
+) -> None:
+    """
+    Cross-worker Redis per-domain rate limiter (~1 req / interval_seconds).
+    Uses atomic `SET rate_limit:{domain} 1 PX <ms> NX` across workers, with
+    automatic fallback to the per-process AsyncLimiter if Redis is unreachable.
+    """
+    d = domain.lower().strip()
+    px_ms = max(200, int(interval_seconds * 1000))
+    key = f"rate_limit:{d}"
+    r = redis_client or await _get_redis()
+    if r is not None:
+        try:
+            for _ in range(15):
+                acquired = await r.set(key, "1", px=px_ms, nx=True)
+                if acquired:
+                    return
+                pttl = await r.pttl(key)
+                wait_s = min(interval_seconds, max(0.05, (pttl / 1000.0) if pttl and pttl > 0 else 0.25))
+                await asyncio.sleep(wait_s)
+            return
+        except Exception:
+            pass
+
+    limiter = get_domain_limiter(d)
+    async with limiter:
+        return
 
 
 async def _get_redis() -> aioredis.Redis | None:

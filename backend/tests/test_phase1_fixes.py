@@ -96,7 +96,7 @@ async def test_never_cache_block_page_and_rotate_profiles():
     scraper = DummyScraper()
     seen_profiles = []
 
-    async def fake_curl(url: str, impersonate: str = "chrome"):
+    async def fake_curl(url: str, impersonate: str = "chrome", force_fresh_session: bool = False):
         seen_profiles.append(impersonate)
         return "<html><title>Captcha</title>Enter the characters you see below</html>"
 
@@ -106,6 +106,9 @@ async def test_never_cache_block_page_and_rotate_profiles():
 
     with (
         patch("app.scrapers.base_scraper.get_redis", return_value=fake_redis),
+        patch("app.scrapers.base_scraper.is_circuit_open", new=AsyncMock(return_value=(False, ""))),
+        patch("app.scrapers.base_scraper.trip_circuit_breaker", new=AsyncMock()),
+        patch("app.scrapers.base_scraper.acquire_domain_rate_limit", new=AsyncMock()),
         patch("app.scrapers.base_scraper._async_jitter", new=AsyncMock()),
         patch.object(scraper, "_fetch_curl_cffi", side_effect=fake_curl),
         patch.object(scraper, "_fetch_playwright", side_effect=ScraperBlockedError("u", 200)),

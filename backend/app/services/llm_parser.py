@@ -372,11 +372,11 @@ class LLMParser:
         except Exception:
             return None
 
-    async def _set_cache(self, key: str, obj: BaseModel) -> None:
+    async def _set_cache(self, key: str, obj: BaseModel, ttl: int | None = None) -> None:
         if self._redis is None:
             return
         try:
-            await self._redis.set(key, obj.model_dump_json(), ex=CACHE_TTL_SECONDS)
+            await self._redis.set(key, obj.model_dump_json(), ex=ttl or CACHE_TTL_SECONDS)
         except Exception:
             pass
 
@@ -472,6 +472,7 @@ class LLMParser:
             return result.offers
         except Exception as exc:
             logger.warning("parse_bank_offers: llm_mode=fallback reason=%s", exc)
+            await self._set_cache(key, BankOfferRuleList(offers=fallback), ttl=300)
             return fallback
 
     # ── 2. Variant Attributes ────────────────
@@ -503,6 +504,7 @@ class LLMParser:
             return result
         except Exception as exc:
             logger.warning("parse_variant_attributes: llm_mode=fallback reason=%s", exc)
+            await self._set_cache(key, fallback, ttl=300)
             return fallback
 
     # ── 3. Review Scam Analysis ──────────────
@@ -540,6 +542,7 @@ class LLMParser:
             return result
         except Exception as exc:
             logger.warning("analyze_reviews: llm_mode=fallback reason=%s", exc)
+            await self._set_cache(key, fallback, ttl=300)
             return fallback
 
     # ── 4. PDF Invoice ───────────────────────
@@ -664,6 +667,7 @@ class LLMParser:
             return result
         except Exception as exc:
             logger.warning("generate_executive_summary: llm_mode=fallback reason=%s", exc)
+            await self._set_cache(key, fallback, ttl=300)
             return fallback
 
 

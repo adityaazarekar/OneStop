@@ -598,7 +598,9 @@ async def match_or_create(
             if existing_prod is not None:
                 if (existing_prod.brand or "").lower() in {"", "generic", "unknown"} and brand.lower() != "unknown":
                     existing_prod.brand = brand
-                listing = await _upsert_listing(session, existing_prod, payload, 1.0)
+                if (existing_prod.model_name or "").strip().lower() in {"", "add to your order", "unknown", "generic"} and model_name.lower() not in {"", "add to your order"}:
+                    existing_prod.model_name = model_name
+                listing = await _upsert_listing(session, existing_prod, payload, 1.0, existing_listing=existing_listing)
                 return existing_prod, listing, 1.0
 
     # ── 1. Exact MPN/EAN match ──
@@ -650,7 +652,7 @@ async def match_or_create(
     )
     session.add(product)
     await session.flush()
-    listing = await _upsert_listing(session, product, payload, 1.0)
+    listing = await _upsert_listing(session, product, payload, 1.0, skip_lookup=True)
     return product, listing, 1.0
 
 
@@ -659,17 +661,21 @@ async def _upsert_listing(
     product: CanonicalProduct,
     payload: ClientPayload,
     confidence: float,
+    existing_listing: RetailerListing | None = None,
+    skip_lookup: bool = False,
 ) -> RetailerListing:
     retailer_clean = (payload.retailer or "generic")[:20]
     sku_clean = (payload.sku or f"SKU-{abs(hash(payload.url or payload.title)) % 10**8}")[:100]
     url_clean = (payload.url or "")[:1000]
 
-    stmt = select(RetailerListing).where(
-        RetailerListing.retailer == retailer_clean,
-        RetailerListing.external_sku == sku_clean,
-    )
-    result = await session.execute(stmt)
-    listing = result.scalar_one_or_none()
+    listing = existing_listing
+    if listing is None and not skip_lookup:
+        stmt = select(RetailerListing).where(
+            RetailerListing.retailer == retailer_clean,
+            RetailerListing.external_sku == sku_clean,
+        )
+        result = await session.execute(stmt)
+        listing = result.scalar_one_or_none()
 
     clean_seller = sanitize_seller_name(payload.seller_name, payload.url, payload.retailer)
     if clean_seller:
@@ -700,6 +706,7 @@ async def _upsert_listing(
             seller_rating=payload.seller_rating,
             match_confidence=confidence,
         )
+        listing._is_new = True
         session.add(listing)
 
     await session.flush()

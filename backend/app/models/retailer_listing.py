@@ -61,9 +61,9 @@ class RetailerListing(Base):
         back_populates="listings"
     )
     price_observations: Mapped[list[PriceObservation]] = relationship(
-        back_populates="listing", lazy="selectin"
+        back_populates="listing", lazy="noload"
     )
     bank_offer_rules: Mapped[list[BankOfferRule]] = relationship(
-        back_populates="listing", lazy="selectin"
+        back_populates="listing", lazy="noload"
     )
 
