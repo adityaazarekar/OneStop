@@ -18,55 +18,39 @@ export function retailerLabel(retailer: string): string {
     tatacliq: "Tata CLiQ",
     jiomart: "JioMart",
   };
-  return map[retailer] || retailer.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+  return (
+    map[retailer] ||
+    retailer.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase())
+  );
 }
 
-export function trustColorClass(score: number): {
-  bg: string;
-  text: string;
-  border: string;
+export type SemanticTone = "accent" | "warn" | "danger" | "neutral";
+
+export function trustTone(score: number): {
+  tone: SemanticTone;
   label: string;
 } {
-  if (score >= 75) {
-    return {
-      bg: "bg-emerald-500/10",
-      text: "text-emerald-400",
-      border: "border-emerald-500/30",
-      label: "Trusted / Low Risk",
-    };
-  }
-  if (score >= 45) {
-    return {
-      bg: "bg-amber-500/10",
-      text: "text-amber-400",
-      border: "border-amber-500/30",
-      label: "Moderate Risk",
-    };
-  }
-  return {
-    bg: "bg-rose-500/10",
-    text: "text-rose-400",
-    border: "border-rose-500/30",
-    label: "High Scam Risk",
-  };
+  if (score >= 75) return { tone: "accent", label: "Good" };
+  if (score >= 45) return { tone: "warn", label: "Moderate" };
+  return { tone: "danger", label: "Caution" };
 }
 
-export function verdictBadge(verdict: string): {
-  bg: string;
-  text: string;
-  border: string;
-  emoji: string;
+export function verdictInfo(verdict: string): {
+  tone: SemanticTone;
+  label: string;
 } {
   switch (verdict) {
     case "BUY_NOW":
-      return { bg: "bg-emerald-500/15", text: "text-emerald-300", border: "border-emerald-500/40", emoji: "🟢" };
+      return { tone: "accent", label: "Buy now" };
     case "WAIT":
-      return { bg: "bg-amber-500/15", text: "text-amber-300", border: "border-amber-500/40", emoji: "🟡" };
+      return { tone: "warn", label: "Wait" };
     case "OVERPRICED":
-      return { bg: "bg-rose-500/15", text: "text-rose-300", border: "border-rose-500/40", emoji: "🔴" };
+      return { tone: "danger", label: "Overpriced" };
     case "FAIR_PRICE":
-      return { bg: "bg-indigo-500/15", text: "text-indigo-300", border: "border-indigo-500/40", emoji: "🔵" };
+      return { tone: "neutral", label: "Fair price" };
+    case "INSUFFICIENT_HISTORY":
+      return { tone: "neutral", label: "Fair price" };
     default:
-      return { bg: "bg-slate-500/15", text: "text-slate-300", border: "border-slate-500/40", emoji: "⚪" };
+      return { tone: "neutral", label: verdict.replace(/_/g, " ") };
   }
 }

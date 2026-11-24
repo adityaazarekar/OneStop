@@ -3,30 +3,80 @@
 @tailwind utilities;
 
 :root {
-  --background: #0a0a12;
-  --foreground: #f3f4f6;
+  --bg: #FAF9F6;
+  --surface: #FFFFFF;
+  --surface-2: #F3F1EC;
+  --border: #E7E4DC;
+  --text: #1C1B18;
+  --muted: #6B675F;
+  --accent: #0F5C47;
+  --accent-hover: #0B4A39;
+  --accent-subtle: #E6F0EC;
+  --warn: #B7791F;
+  --warn-subtle: #FBF4E4;
+  --danger: #B4412E;
+  --danger-subtle: #FAECE9;
+  --shadow-popover: 0 4px 16px rgba(28, 27, 24, 0.08);
+}
+
+.dark {
+  --bg: #121210;
+  --surface: #1A1A17;
+  --surface-2: #22211E;
+  --border: #2A2925;
+  --text: #EDEBE4;
+  --muted: #9A968C;
+  --accent: #4FB08C;
+  --accent-hover: #62BE9B;
+  --accent-subtle: #1B2B25;
+  --warn: #D99B38;
+  --warn-subtle: #282115;
+  --danger: #DC6A56;
+  --danger-subtle: #2B1A17;
+  --shadow-popover: 0 4px 20px rgba(0, 0, 0, 0.4);
+}
+
+html {
+  background-color: var(--bg);
+  color: var(--text);
 }
 
 body {
-  color: var(--foreground);
-  background: var(--background);
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen,
-    Ubuntu, Cantarell, "Fira Sans", "Droid Sans", "Helvetica Neue", sans-serif;
+  background-color: var(--bg);
+  color: var(--text);
+  font-family: var(--font-geist), system-ui, -apple-system, sans-serif;
   overflow-x: hidden;
+  -webkit-font-smoothing: antialiased;
 }
 
-/* Custom scrollbars */
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
 ::-webkit-scrollbar {
   width: 6px;
   height: 6px;
 }
 ::-webkit-scrollbar-track {
-  background: #12121a;
+  background: var(--bg);
 }
 ::-webkit-scrollbar-thumb {
-  background: #272738;
+  background: var(--border);
   border-radius: 3px;
-}
-::-webkit-scrollbar-thumb:hover {
-  background: #3f3f5a;
 }
