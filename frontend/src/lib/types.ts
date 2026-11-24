@@ -83,7 +83,7 @@ export interface StackStep {
   description: string;
   amount_deducted: number;
   running_price: number;
-  verification_status: "verified_on_page" | "stack_path" | "fee";
+  verification_status: "verified_on_page" | "stack_path" | "fee" | "post_purchase";
 }
 
 export interface AlternativeOptimizationPath {
@@ -132,7 +132,11 @@ export interface StoreRankingChoice {
   store_name: string;
   url: string;
   listed_price: number;
+  checkout_cash_price?: number;
+  best_user_card_net_price?: number;
   effective_price: number;
+  in_stock?: boolean;
+  is_current_store?: boolean;
   seller_name: string;
   peace_of_mind_score: number;
   return_terms: string;
@@ -140,6 +144,30 @@ export interface StoreRankingChoice {
   overall_score: number;
   rank_badge: string;
   is_overall_winner: boolean;
+  store_bucket?: "exact_match" | "lesser_known_store" | "variant_mismatch";
+  variant_diff_badges?: string[];
+  eta_label?: string;
+}
+
+export interface QuickCommerceQuote {
+  platform: string;
+  app_name: string;
+  title: string;
+  url: string;
+  pincode: string;
+  selling_price: number;
+  mrp?: number | null;
+  pack_size?: string | null;
+  unit_price_inr?: number | null;
+  unit_price_label?: string | null;
+  eta_minutes_label: string;
+  in_stock: boolean;
+  handling_fee_inr: number;
+  delivery_fee_inr: number;
+  surge_fee_inr: number;
+  small_cart_fee_inr: number;
+  total_payable_inr: number;
+  badge: string;
 }
 
 export interface ExecutiveSummary {
@@ -150,6 +178,61 @@ export interface ExecutiveSummary {
   why_this_wins: string;
   key_caveat: string;
   summary_bullets: string[];
+}
+
+export type VerificationStatus = "page_verified" | "live_tc_verified" | "issuer_tc_verified" | "no_verified_offer";
+
+export interface PostPurchaseRewards {
+  reward_type: string;
+  points_earned: number;
+  conversion_ratio_cash: string;
+  conversion_ratio_travel: string;
+  cash_value_inr: number;
+  travel_value_inr: number;
+  monthly_cap_inr: number | null;
+  cap_applied: boolean;
+  processing_fee_inr: number;
+}
+
+export interface PaymentRouteAnalysis {
+  route_type: "direct_points_card" | "direct_cashback_card" | "gift_voucher_stack" | "upi_app_offer" | "unowned_card";
+  route_label: string;
+  method_name: string;
+  is_owned_card?: boolean;
+  available: boolean;
+  checkout_payable_inr: number;
+  instant_discount_inr: number;
+  rewards: PostPurchaseRewards;
+  effective_cost_if_cash_inr: number;
+  effective_cost_if_optimal_redemption_inr: number;
+  verification_status: VerificationStatus;
+  source_urls: string[];
+  exclusions: string[];
+  last_verified_at: string | null;
+  summary: string;
+}
+
+export interface CashVsPointsReport {
+  listed_price: number;
+  coupon_discount_inr: number;
+  mandatory_fees_inr: number;
+  instant_bank_discount_inr: number;
+  checkout_payable_inr: number;
+  best_user_card_net_price_cash?: number;
+  best_user_card_net_price_optimal?: number;
+  winning_owned_card_name?: string | null;
+  winning_instant_offer_summary?: string | null;
+  user_wallet_empty?: boolean;
+  requires_offer_verification?: boolean;
+  offer_verification_note?: string;
+  emi_offers?: Array<Record<string, any>>;
+  gate_audit_log?: Array<Record<string, any>>;
+  routes: PaymentRouteAnalysis[];
+  unowned_card_routes?: PaymentRouteAnalysis[];
+  best_route_cash: string | null;
+  best_route_optimal: string | null;
+  efficiency_verdict: string;
+  terms_last_verified_at: string | null;
 }
 
 export interface AnalysisResponse {
@@ -170,7 +253,9 @@ export interface AnalysisResponse {
   stacked_offers?: StackedEffectivePriceResult | null;
   seller_report?: MultiSellerReport | null;
   ranked_store_choices?: StoreRankingChoice[];
+  quick_commerce_quotes?: QuickCommerceQuote[];
   llm_summary?: ExecutiveSummary | null;
+  cash_vs_points?: CashVsPointsReport | null;
 }
 
 export interface RecentProduct {
@@ -203,7 +288,9 @@ export interface ProductDetails {
   stacked_offers?: StackedEffectivePriceResult | null;
   seller_report?: MultiSellerReport | null;
   ranked_store_choices?: StoreRankingChoice[];
+  quick_commerce_quotes?: QuickCommerceQuote[];
   llm_summary?: ExecutiveSummary | null;
+  cash_vs_points?: CashVsPointsReport | null;
 }
 
 export interface PriceObservationPoint {

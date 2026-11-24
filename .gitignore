@@ -59,3 +59,6 @@ Thumbs.db
 # Chrome extension pack files
 *.crx
 *.pem
+
+# Project-local toolchain (pip cache, browsers, temp)
+.toolchain/

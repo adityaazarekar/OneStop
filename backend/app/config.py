@@ -11,13 +11,20 @@ _BACKEND_DIR = Path(__file__).resolve().parent.parent
 
 
 class Settings(BaseSettings):
-    database_url: str = "postgresql+asyncpg://onestop:onestop_dev@localhost:5432/onestop"
-    database_url_sync: str = "postgresql+psycopg2://onestop:onestop_dev@localhost:5432/onestop"
+    database_url: str = "postgresql+asyncpg://onestop:onestop_dev@localhost:5433/onestop"
+    database_url_sync: str = "postgresql+psycopg2://onestop:onestop_dev@localhost:5433/onestop"
     redis_url: str = "redis://localhost:6379/0"
+    env: Literal["development", "production", "test"] = "development"
     scraper_mode: Literal["live", "mock"] = "live"
+    scraper_proxy_url: str = ""
     gemini_api_key: str = ""
     openrouter_api_key: str = ""
     openrouter_model: str = "google/gemini-2.5-flash"
+    searxng_url: str = "http://localhost:8080"
+    serper_api_key: str = ""
+    default_pincode: str = "411001"
+    quickcommerce_api_key: str = ""
+    scrapingdog_api_key: str = ""
     app_secret_key: str = "change-me-in-production"
     cors_origins: list[str] = Field(default=["http://localhost:3000", "http://127.0.0.1:3000"])
 

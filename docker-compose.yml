@@ -6,7 +6,7 @@ services:
       POSTGRES_PASSWORD: onestop_dev
       POSTGRES_DB: onestop
     ports:
-      - "5432:5432"
+      - "5433:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -14,6 +14,7 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+    restart: unless-stopped
 
   redis:
     image: redis:7-alpine
@@ -26,8 +27,60 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+    restart: unless-stopped
+
+  searxng:
+    image: searxng/searxng:latest
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./searxng:/etc/searxng
+    environment:
+      - SEARXNG_BASE_URL=http://localhost:8080/
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://onestop:onestop_dev@db:5432/onestop
+      DATABASE_URL_SYNC: postgresql+psycopg2://onestop:onestop_dev@db:5432/onestop
+      REDIS_URL: redis://redis:6379/0
+      ENV: ${ENV:-development}
+      SCRAPER_MODE: ${SCRAPER_MODE:-live}
+      SCRAPER_PROXY_URL: ${SCRAPER_PROXY_URL:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-google/gemini-2.5-flash}
+      SEARXNG_URL: http://searxng:8080
+      SERPER_API_KEY: ${SERPER_API_KEY:-}
+      DEFAULT_PINCODE: ${DEFAULT_PINCODE:-411001}
+      APP_SECRET_KEY: ${APP_SECRET_KEY:-change-me-in-production}
+      CORS_ORIGINS: '["http://localhost:3000"]'
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      searxng:
+        condition: service_started
+    command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: http://localhost:8000
+    ports:
+      - "3000:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+    depends_on:
+      - backend
 
 volumes:
   pgdata:
   redisdata:
-

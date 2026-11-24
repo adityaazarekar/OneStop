@@ -34,6 +34,6 @@ class CanonicalProduct(Base):
     )
 
     listings: Mapped[list[RetailerListing]] = relationship(
-        back_populates="canonical_product", lazy="selectin"
+        back_populates="canonical_product", lazy="noload"
     )
 

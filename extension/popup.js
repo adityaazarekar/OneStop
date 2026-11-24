@@ -1,5 +1,5 @@
 /**
- * OneStop Popup — Card Wallet Manager + Universal Page Trigger
+ * OneStop Popup — Card Wallet Manager + Page Check Trigger
  */
 (function () {
   "use strict";
@@ -10,8 +10,6 @@
   const btnAnalyze = document.getElementById("btnAnalyze");
   const statusEl = document.getElementById("status");
 
-  // ── Load cards from backend & restore saved selections ──
-
   async function loadCards() {
     try {
       const resp = await fetch(`${API_BASE}/cards`, {
@@ -21,11 +19,10 @@
       const cards = await resp.json();
 
       if (cards.length === 0) {
-        cardList.innerHTML = '<div class="status">No cards seeded. Run seed.py first.</div>';
+        cardList.innerHTML = '<div class="status">No cards found. Run seed.py first.</div>';
         return;
       }
 
-      // Restore saved selections
       const storage = await chrome.storage.local.get(["userCardIds"]);
       const savedIds = new Set(storage.userCardIds || []);
 
@@ -45,13 +42,10 @@
       }
 
       updateSavedCount();
-
-      // Listen for checkbox changes
       cardList.addEventListener("change", onCardChange);
     } catch (err) {
-      cardList.innerHTML = `<div class="status error">
-        ⚠️ Cannot reach backend at ${API_BASE}<br>
-        <span style="font-size:11px;color:#888">Start it with: uvicorn app.main:app --port 8000</span>
+      cardList.innerHTML = `<div class="status error" style="padding:10px 0;">
+        Cannot reach backend at ${API_BASE}
       </div>`;
     }
   }
@@ -65,35 +59,32 @@
 
   function updateSavedCount() {
     const count = cardList.querySelectorAll('input[type="checkbox"]:checked').length;
-    savedCount.textContent = count > 0 ? `✅ ${count} card${count > 1 ? "s" : ""} selected` : "";
+    savedCount.textContent = count > 0 ? `${count} selected` : "None selected";
   }
-
-  // ── Analyze Current Tab ───────────────────
 
   btnAnalyze.addEventListener("click", async () => {
     btnAnalyze.disabled = true;
-    btnAnalyze.innerHTML = '<span class="loading-spinner"></span> Analyzing...';
+    btnAnalyze.textContent = "Checking...";
     statusEl.textContent = "";
     statusEl.className = "status";
 
     try {
       const response = await chrome.runtime.sendMessage({ type: "ONESTOP_ANALYZE_TAB" });
       if (response && response.success) {
-        statusEl.textContent = "✅ Analysis complete! Check the floating widget on the page.";
+        statusEl.textContent = "Ready. Open the OneStop button on the page.";
         statusEl.className = "status success";
       } else {
-        statusEl.textContent = "⚠️ " + (response?.error || "Analysis failed");
+        statusEl.textContent = response?.error || "Could not check this page.";
         statusEl.className = "status error";
       }
     } catch (err) {
-      statusEl.textContent = "⚠️ " + err.message;
+      statusEl.textContent = err.message || "Could not check this page.";
       statusEl.className = "status error";
     } finally {
       btnAnalyze.disabled = false;
-      btnAnalyze.innerHTML = "🔍 Analyze Current Tab";
+      btnAnalyze.textContent = "Check this page";
     }
   });
 
-  // ── Init ──
   loadCards();
 })();

@@ -304,6 +304,59 @@ function parseTataCliq(doc) {
   return results;
 }
 
+function parseGenericRetailer(doc, retailer, baseOrigin) {
+  const results = [];
+  // 1. JSON-LD itemList
+  const ldScripts = doc.querySelectorAll('script[type="application/ld+json"]');
+  for (const script of ldScripts) {
+    try {
+      const data = JSON.parse(script.textContent);
+      const items = data.itemListElement || (Array.isArray(data) ? data : []);
+      for (let i = 0; i < Math.min(items.length, 4); i++) {
+        const item = items[i].item || items[i];
+        if (!item || !item.name) continue;
+        const off = item.offers ? (Array.isArray(item.offers) ? item.offers[0] : item.offers) : {};
+        const price = parseIndianPrice(String(off.price || off.lowPrice || ""));
+        if (price && item.url) {
+          results.push({
+            retailer,
+            title: String(item.name).trim(),
+            listed_price: price,
+            url: item.url.startsWith("http") ? item.url : baseOrigin + item.url,
+            sku: String(item.sku || ""),
+            in_stock: true,
+          });
+        }
+      }
+    } catch (_) {}
+    if (results.length >= 3) break;
+  }
+  if (results.length > 0) return results;
+
+  // 2. Generic product card DOM heuristic
+  const cards = doc.querySelectorAll("li.product-base, div.item.rilrtl-products-list__item, div.productWrapper, li.ais-InfiniteHits-item, [class*='product-card'], [class*='ProductCard']");
+  for (let i = 0; i < Math.min(cards.length, 4); i++) {
+    const c = cards[i];
+    const link = c.querySelector("a[href]");
+    const priceM = (c.textContent || "").match(/(?:₹|Rs\.?)\s*([\d,]{2,})/);
+    const price = priceM ? parseIndianPrice(priceM[1]) : null;
+    const titleEl = c.querySelector("h3, h4, .product-product, .nameCls, [class*='title'], [class*='name']");
+    const title = titleEl ? titleEl.textContent.trim() : "";
+    if (link && price && title) {
+      const href = link.getAttribute("href") || "";
+      results.push({
+        retailer,
+        title,
+        listed_price: price,
+        url: href.startsWith("http") ? href : baseOrigin + (href.startsWith("/") ? "" : "/") + href,
+        sku: "",
+        in_stock: true,
+      });
+    }
+  }
+  return results;
+}
+
 function parseDuckDuckGo(doc, retailer, domain) {
   const results = [];
   const items = doc.querySelectorAll(".result, .web-result, div.results_links");
@@ -374,6 +427,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         quotes = parseVijaySales(doc);
       } else if (retailer === "tatacliq") {
         quotes = parseTataCliq(doc);
+      } else if (retailer === "myntra") {
+        quotes = parseGenericRetailer(doc, "myntra", "https://www.myntra.com");
+      } else if (retailer === "ajio") {
+        quotes = parseGenericRetailer(doc, "ajio", "https://www.ajio.com");
+      } else if (retailer === "nykaa") {
+        quotes = parseGenericRetailer(doc, "nykaa", "https://www.nykaa.com");
+      } else if (retailer === "jiomart") {
+        quotes = parseGenericRetailer(doc, "jiomart", "https://www.jiomart.com");
       }
 
       sendResponse({ success: true, quotes });

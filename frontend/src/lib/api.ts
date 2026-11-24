@@ -8,7 +8,25 @@ import {
   VaultItem,
 } from "./types";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000/api/v1";
+export const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000/api/v1";
+
+export async function startCompareAllStores(
+  payload: Record<string, any>,
+  pincode = "411001",
+  userCardIds: string[] = []
+): Promise<{ job_id: string; pincode: string }> {
+  const res = await fetch(`${API_BASE}/compare-all-stores`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      payload,
+      pincode,
+      user_card_ids: userCardIds,
+    }),
+  });
+  if (!res.ok) throw new Error("Failed to start store comparison stream");
+  return res.json();
+}
 
 export async function fetchCards(): Promise<CreditCard[]> {
   try {
@@ -34,9 +52,17 @@ export async function fetchRecentProducts(limit = 12): Promise<RecentProduct[]> 
   }
 }
 
-export async function fetchProductDetails(id: string): Promise<ProductDetails | null> {
+export async function fetchProductDetails(
+  id: string,
+  cardIds: string[] = [],
+  liveTerms = false
+): Promise<ProductDetails | null> {
   try {
-    const res = await fetch(`${API_BASE}/products/${id}`, { cache: "no-store" });
+    const params = new URLSearchParams();
+    cardIds.forEach((cid) => params.append("card_ids", cid));
+    if (liveTerms) params.set("live_terms", "true");
+    const qs = params.toString();
+    const res = await fetch(`${API_BASE}/products/${id}${qs ? `?${qs}` : ""}`, { cache: "no-store" });
     if (!res.ok) return null;
     return res.json();
   } catch (err) {
