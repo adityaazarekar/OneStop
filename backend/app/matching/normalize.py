@@ -484,6 +484,10 @@ def normalize_size(raw: str) -> tuple[str | None, Decimal | None, str | None]:
         return None, None, None
 
     s = " ".join(str(raw).strip().split())
+    if s.upper().startswith("ALPHA:"):
+        code = s.split(":", 1)[1].strip().upper()
+        if code in _ALPHA_SIZE_MAP.values():
+            return "ALPHA", None, f"ALPHA:{code}"
     s_low = re.sub(r"^size\s*[-:]?\s*", "", s.lower()).strip()
 
     if s_low in _ALPHA_SIZE_MAP:
